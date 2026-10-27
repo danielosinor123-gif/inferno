@@ -4,12 +4,13 @@
 //!
 //! Semantics implemented here, mapped to the paper:
 //! * Fixed-size blocks (default 16 tokens) drawn from a preallocated pool
-//!   (§4.1). No fragmentation: every block is fully usable.
-//! * Per-sequence block tables (§4.1) — a logical sequence maps to an
+//!   (§4.2 KV Cache Manager). No fragmentation: every block is fully usable.
+//! * Per-sequence block tables (§4.2) — a logical sequence maps to an
 //!   arbitrary set of physical blocks.
 //! * Copy-on-write on shared blocks (§4.2): a block with refcount > 1 is
 //!   never written in place; the writer gets a private copy.
-//! * Prefix caching (§4.3-ish): completed blocks are registered under a
+//! * Retained-KV prefix caching (RadixAttention semantics, arXiv:2312.07104):
+//!   completed blocks are registered under a
 //!   content+position hash (hash covers tokens[0..=(k+1)*block_size), so it
 //!   is position-dependent — RoPE makes absolute position matter, so sharing
 //!   a block whose prefix differs would be wrong).
@@ -270,7 +271,9 @@ impl KvCache {
         *r -= 1;
         if *r == 0 {
             self.refs.remove(&block);
-            // vLLM §4.3 semantics: freed blocks REMAIN content-addressable —
+            // RadixAttention semantics (arXiv:2312.07104 — deep-read verified:
+            // the vLLM *paper* does NOT prescribe this; SGLang's LRU KV cache
+            // does): freed blocks REMAIN content-addressable —
             // they go to the free list still holding valid K/V for their
             // hash, and stay in prefix/canonical_of until a fresh allocation
             // evicts them. This is what makes duplicate prompts after the

@@ -29,7 +29,7 @@ foresight-infer HTTP plane (OpenAI-compat API)      [next PR]
 
 | Pillar | Mechanism | Grounded in |
 |---|---|---|
-| **Speed** | online-softmax attention (single pass, no score materialization); blocked matmul; per-step budgeted scheduling | FlashAttention (2205.14135), FlashDecoding++ (2310.11453) |
+| **Speed** | online-softmax attention (single pass, no score materialization); blocked matmul; per-step budgeted scheduling | FlashAttention (2205.14135), FlashDecoding++ (2311.01282) |
 | **Concurrency** | iteration-level scheduling: sequences join/leave the batch every step; chunked prefill keeps long prompts from stalling decodes; SLO-aware priority admission | Orca (OSDI'22), Sarathi-Serve (2403.02310), DistServe (2401.09670) |
 | **Memory efficiency** | paged KV cache (zero fragmentation by construction), refcounted block sharing, copy-on-write, freed blocks stay content-addressable until evicted | vLLM/PagedAttention (2309.06180), RadixAttention (2312.07104) |
 | **Easy accessible threads** | `ThreadPool::new(n)` + `spawn(f) -> JoinHandle` + `map_chunks(data, f)`; ~100 verified lines, shutdown-correct under park | our design (see threads.rs header for why not work-stealing) |

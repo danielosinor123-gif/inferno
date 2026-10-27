@@ -1,7 +1,7 @@
 //! Continuous batching engine — iteration-level scheduling (Orca, Yu et al.,
 //! OSDI 2022) with chunked prefill (Sarathi-Serve, arXiv:2403.02310), SLO-
 //! aware ordering, and recompute-preemption on KV exhaustion (vLLM,
-//! arXiv:2309.06180 §4.4).
+//! arXiv:2309.06180 §4.5 Scheduling and Preemption).
 //!
 //! One `step()` is one scheduler iteration:
 //!   1. ADMIT waiting sequences into the running set (priority order),
@@ -298,7 +298,8 @@ impl Batcher {
             match cache.reserve(seq.id, seq.prompt.len(), &hashes) {
                 Some(info) => {
                     seq.reused_blocks = info.reused;
-                    // Shared complete prefix needs no recompute (vLLM §4.3).
+                    // Shared complete prefix needs no recompute
+                    // (RadixAttention, arXiv:2312.07104 — retained KV reuse).
                     seq.pos = (info.reused * bs).min(seq.prompt.len());
                     seq.queue_wait_us = seq.arrival.elapsed().as_secs_f64() * 1e6;
                     seq.state = SeqState::Prefill;
