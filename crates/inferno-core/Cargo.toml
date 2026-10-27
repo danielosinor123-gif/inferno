@@ -1,0 +1,13 @@
+[package]
+name = "inferno-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Concurrent LLM inference runtime layered on top of foresight-sched"
+
+[dependencies]
+# Deliberately zero runtime dependencies on the portable path.
+# The foresight-sched BPF client uses raw syscalls (libc) on Linux only.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -1,0 +1,13 @@
+[package]
+name = "inferno-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmark harness for the inferno scheduler layer (threads, KV, batching)"
+
+[dependencies]
+inferno-core = { path = "../inferno-core" }
+
+[[bin]]
+name = "inferno-bench"
+path = "src/main.rs"
