@@ -78,7 +78,13 @@ impl Engine for PseudoEngine {
         }
     }
 
-    fn decode_kv(&self, tok: u32, pos: usize) -> Vec<f32> {
+    fn decode_kv(
+        &mut self,
+        _seq: &Sequence,
+        tok: u32,
+        pos: usize,
+        _cache: &KvCache,
+    ) -> Vec<f32> {
         token_kv(tok, pos, self.layers, self.kv_dim)
     }
 }

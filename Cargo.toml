@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/inferno-core", "crates/inferno-bench"]
+members = ["crates/inferno-core", "crates/inferno-bench", "crates/inferno-model"]
 
 [workspace.package]
 version = "0.1.0"

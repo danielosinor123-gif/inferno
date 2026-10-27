@@ -7,9 +7,11 @@ high-speed LLM inference server needs, **built on top of** the
 sched_ext CPU scheduler rather than replacing it.
 
 ```
-foresight-infer HTTP plane (OpenAI-compat API)      [next PR]
+HTTP plane (OpenAI-compat API)                     [next PR]
 ┌────────────────────────────────────────────────┐
-│ inferno-core (this repo)                       │
+│ inferno-model (real weights: Qwen2.5-0.5B,     │
+│   safetensors + HF tokenizer, gemv engine)     │
+│ inferno-core                                   │
 │   threads    — worker pool ("easy threads")    │
 │   memory     — arena + recycled buffers        │
 │   kv_cache   — paged KV, prefix sharing, CoW   │
@@ -24,6 +26,13 @@ foresight-infer HTTP plane (OpenAI-compat API)      [next PR]
                        ▼
    foresight_sched BPF scheduler (kernel 6.18.33.2, SCX lanes)
 ```
+
+**Status: real-weights phase in progress** — `inferno-model` (Qwen2.5-0.5B-Instruct
+via safetensors, fp16→f32, one forward pass per generated token, greedy
+sampling) is wired into the same `Engine`/paged-KV path the scheduler layer
+was benchmarked on. First real TTFT/TPOT numbers land with the next commit.
+Design + limitation notes live in `crates/inferno-model/src/engine.rs` and
+`docs/DEEP-READ.md`.
 
 ## The four pillars
 

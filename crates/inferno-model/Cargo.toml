@@ -1,0 +1,12 @@
+[package]
+name = "inferno-model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inferno-core = { path = "../inferno-core" }
+safetensors = "0.4"
+# BPE-only (Qwen2); fancy-regex = pure-Rust backend (no Oniguruma C dep).
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+serde_json = "1"
+memmap2 = "0.9"

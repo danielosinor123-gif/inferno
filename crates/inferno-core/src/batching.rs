@@ -77,8 +77,11 @@ pub trait Engine {
     /// One decode iteration for the sequence; returns the token. May update
     /// sequence bookkeeping (simulated cost).
     fn decode_step(&mut self, seq: &mut Sequence, cache: &KvCache) -> u32;
-    /// K/V the engine would store for (token, absolute position).
-    fn decode_kv(&self, tok: u32, pos: usize) -> Vec<f32>;
+    /// K/V the engine computed for `tok` at absolute position `pos`, for the
+    /// batcher to write into the paged cache. Real engines run their forward
+    /// pass here (that pass also produces the logits the NEXT decode_step
+    /// argmaxes); the pseudo engine derives K/V analytically.
+    fn decode_kv(&mut self, seq: &Sequence, tok: u32, pos: usize, cache: &KvCache) -> Vec<f32>;
     /// EOS token, if the model defines one.
     fn eos(&self) -> Option<u32> {
         None
@@ -141,6 +144,9 @@ pub struct Batcher {
     metrics: Vec<SeqMetrics>,
     total_preemptions: usize,
     finished_ids: Vec<u64>,
+    /// Generated token ids per finished sequence (model mode uses this to
+    /// decode text; the metrics alone carry only lengths).
+    pub finished_tokens: Vec<(u64, Vec<u32>)>,
 }
 
 impl Batcher {
@@ -154,6 +160,7 @@ impl Batcher {
             metrics: Vec::new(),
             total_preemptions: 0,
             finished_ids: Vec::new(),
+            finished_tokens: Vec::new(),
         }
     }
 
@@ -266,6 +273,7 @@ impl Batcher {
             priority: seq.priority,
         });
         self.finished_ids.push(seq.id);
+        self.finished_tokens.push((seq.id, seq.generated.clone()));
         cache.release(seq.id);
         out.finished += 1;
     }
@@ -350,7 +358,7 @@ impl Batcher {
                 let tok = engine.decode_step(seq, &cache);
                 seq.first_token_at = Some(Instant::now());
                 seq.generated.push(tok);
-                let kv = engine.decode_kv(tok, need_pos);
+                let kv = engine.decode_kv(seq, tok, need_pos, &cache);
                 if cache.write_token(seq.id, need_pos, &kv).is_err() {
                     let mut seq = running.swap_remove(i);
                     self.preempt(&mut seq, &mut cache, &mut out);
@@ -385,7 +393,7 @@ impl Batcher {
             }
             let tok = engine.decode_step(seq, &cache);
             seq.generated.push(tok);
-            let kv = engine.decode_kv(tok, need_pos);
+            let kv = engine.decode_kv(seq, tok, need_pos, &cache);
             if cache.write_token(seq.id, need_pos, &kv).is_err() {
                 seq.generated.pop(); // roll back before preempt
                 let mut seq = running.swap_remove(i);

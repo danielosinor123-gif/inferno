@@ -23,6 +23,7 @@ use inferno_core::kv_cache::KvConfig;
 use inferno_core::pseudo::PseudoEngine;
 use inferno_core::sched::{Admission, AdmissionClass, NullAdmission};
 use inferno_core::threads::ThreadPool;
+use inferno_model::QwenEngine;
 
 #[cfg(target_os = "linux")]
 use inferno_core::sched_linux::ForesightAdmission;
@@ -392,6 +393,198 @@ fn cmd_overhead() {
     );
 }
 
+/// Instrumented drain: per-step trace on stderr (unbuffered), livelock guard,
+/// hard step cap. Returns nothing; the batcher accumulates metrics.
+fn drain_traced(b: &mut Batcher, e: &mut QwenEngine, adm: &dyn Admission) {
+    let mut steps = 0usize;
+    let mut idle = 0usize;
+    loop {
+        if b.queue_depth() == 0 {
+            break;
+        }
+        let r = b.step(e, adm);
+        steps += 1;
+        if r.admitted == 0 && r.prefill_tokens == 0 && r.decode_tokens == 0 && r.preempted == 0
+        {
+            idle += 1;
+            if idle > 100 {
+                eprintln!("  [trace] LIVELOCK: 100 idle steps (total {steps})");
+                break;
+            }
+        } else {
+            idle = 0;
+            eprintln!(
+                "  [trace] step {steps}: admitted {} prefill {} decode {} preempt {}",
+                r.admitted, r.prefill_tokens, r.decode_tokens, r.preempted
+            );
+        }
+        if steps >= 200_000 {
+            eprintln!("  [trace] STEP CAP HIT — aborting drain");
+            break;
+        }
+    }
+    eprintln!("  [trace] drain done: {steps} steps");
+}
+
+fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
+    let a = args();
+    let dir = flag(&a, "--model-dir", "/root/models/qwen2.5-0.5b");
+    let prompt = flag(&a, "--prompt", "The capital of France is");
+    let max_gen: usize = flag(&a, "--max-gen", "24").parse().unwrap_or(24);
+    let blocks: usize = flag(&a, "--blocks", "512").parse().unwrap_or(512);
+
+    println!("model mode — loading {dir} ...");
+    let mut engine = QwenEngine::load(std::path::Path::new(&dir)).expect("model load failed");
+    println!(
+        "  model: {} layers | {} q / {} kv heads, head_dim {} | hidden {} | vocab {}",
+        engine.cfg.num_layers,
+        engine.cfg.num_q_heads,
+        engine.cfg.num_kv_heads,
+        engine.cfg.head_dim,
+        engine.cfg.hidden,
+        engine.cfg.vocab
+    );
+
+    let prompt_ids = engine.encode_text(&prompt);
+    println!("  prompt: {prompt:?} -> {} tokens: {prompt_ids:?}", prompt_ids.len());
+    let roundtrip = engine.decode_text(&prompt_ids);
+    println!("  round-trip: {roundtrip:?} {}", if roundtrip == prompt { "OK" } else { "MISMATCH <-- tokenizer broken" });
+    for &tid in &prompt_ids {
+        println!(
+            "    tok {tid:>6}  {:?}",
+            engine.decode_text(&[tid])
+        );
+    }
+
+    // forward-path probe: top-5 next-token candidates straight through the
+    // engine (no batcher) — separates math bugs from batcher wiring bugs
+    let top = engine.diagnostic_topk(&prompt_ids, 5);
+    for (tok, lg) in &top {
+        println!(
+            "  probe: logit {lg:8.3}  tok {tok:>6}  {:?}",
+            engine.decode_text(&[*tok])
+        );
+    }
+
+    let cfg = engine.cfg.clone();
+    let mut batcher = Batcher::new(
+        KvConfig {
+            block_size: 16,
+            num_blocks: blocks,
+            num_layers: cfg.num_layers,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+        },
+        BatcherConfig {
+            prefill_chunk_tokens: 64,
+            max_num_seqs: 8,
+        },
+    );
+    let id = batcher.submit(Submit {
+        prompt: prompt_ids.clone(),
+        max_gen,
+        priority: Priority::Normal,
+        ttft_slo_ms: 10_000.0,
+    });
+    // Determinism + retention gate. Two modes:
+    //   --repeats N        submit N identical requests up front (concurrent;
+    //                      they all reserve before any registration, so
+    //                      reuse stays 0 — the determinism gate).
+    //   --stagger N        N sequential rounds: submit ONE request, drain it
+    //                      to completion, then submit the next. The prefix
+    //                      cache persists across rounds, so rounds 2+ must
+    //                      show reused_blocks >= 1 (the retention gate).
+    let repeats: usize = flag(&a, "--repeats", "1").parse().unwrap_or(1);
+    let stagger: bool = flag(&a, "--stagger", "0") == "1";
+    let t0 = Instant::now();
+    if stagger {
+        for r in 0..repeats {
+            let id = batcher.submit(Submit {
+                prompt: prompt_ids.clone(),
+                max_gen,
+                priority: Priority::Normal,
+                ttft_slo_ms: 10_000.0,
+            });
+            eprintln!("  [trace] round {r}: submitted id {id}");
+            drain_traced(&mut batcher, &mut engine, admission.as_ref());
+        }
+    } else {
+        for _ in 0..repeats {
+            batcher.submit(Submit {
+                prompt: prompt_ids.clone(),
+                max_gen,
+                priority: Priority::Normal,
+                ttft_slo_ms: 10_000.0,
+            });
+        }
+        drain_traced(&mut batcher, &mut engine, admission.as_ref());
+    }
+    let wall = t0.elapsed();
+    println!("  drained in {:.2} s", wall.as_secs_f64());
+
+    let mut first_ids: Option<&Vec<u32>> = None;
+    for (i, toks) in batcher.finished_tokens.iter() {
+        if let Some(m) = batcher.metrics().iter().find(|m| m.id == *i) {
+            println!(
+                "  req {i}: ttft {:.1} ms | tpot {:.1} ms | gen {} tok | reuse {} blk | preempt {}",
+                m.ttft_us / 1e3,
+                m.tpot_us / 1e3,
+                m.gen_len,
+                m.reused_blocks,
+                m.preempted
+            );
+        }
+        let text = engine.decode_text(toks);
+        let same = first_ids.map(|f| f == toks).unwrap_or(true);
+        let top = engine.stash_topk(*i, 3).unwrap_or_default();
+        println!(
+            "  req {i} ids: {:?}\n  req {i} text: {text}{}",
+            toks,
+            if same { "" } else { "  <-- DETERMINISM FAIL" }
+        );
+        println!(
+            "  req {i} final-stash top3: {:?}",
+            top.iter().map(|(t, l)| (format!("{l:.3}"), engine.decode_text(&[*t]))).collect::<Vec<_>>()
+        );
+        if first_ids.is_none() {
+            first_ids = Some(toks);
+        }
+    }
+    if batcher.finished_tokens.is_empty() {
+        println!("  WARNING: no finished requests — KV capacity or preemption issue");
+    }
+}
+
+fn cmd_tok() {
+    let tok = tokenizers::Tokenizer::from_file("/root/models/qwen2.5-0.5b/tokenizer.json")
+        .expect("tokenizer load failed");
+    for text in [
+        "The capital of France is",
+        "Hello",
+        "The",
+        " is",
+        "Hello world",
+    ] {
+        let enc = tok.encode(text, true).expect("encode failed");
+        println!("{text:?}");
+        println!("  ids:    {:?}", enc.get_ids());
+        println!("  tokens: {:?}", enc.get_tokens());
+        match tok.decode(enc.get_ids(), false) {
+            Ok(d) => println!("  decode: {d:?}"),
+            Err(e) => println!("  decode: ERROR {e}"),
+        }
+    }
+    let a = tok.encode("The", true).unwrap().get_ids().to_vec();
+    let b = tok.encode("The", true).unwrap().get_ids().to_vec();
+    println!("same-process twice: {a:?} vs {b:?}");
+    println!(
+        "id_to_token(785)={:?} id_to_token(9707)={:?} id_to_token(374)={:?}",
+        tok.id_to_token(785),
+        tok.id_to_token(9707),
+        tok.id_to_token(374)
+    );
+}
+
 fn main() {
     let a = args();
     let mode = a.first().map(|s| s.as_str()).unwrap_or("load");
@@ -400,10 +593,14 @@ fn main() {
         "threads" => cmd_threads(),
         "load" => cmd_load(admission, label),
         "overhead" => cmd_overhead(),
+        "model" => cmd_model(admission),
+        "tok" => cmd_tok(),
         _ => {
-            eprintln!("usage: inferno-bench [load|threads] [options]");
+            eprintln!("usage: inferno-bench [load|threads|model|overhead] [options]");
             eprintln!("  load: --requests N --max-gen N --prompt-min N --prompt-max N --chunk N --seqs N [--tag-interactive]");
             eprintln!("  threads: --threads N");
+            eprintln!("  model: --model-dir PATH [--prompt TEXT] [--max-gen N] [--blocks N]");
+            eprintln!("  tok: (no options) direct tokenizers-crate probe");
             std::process::exit(2);
         }
     }

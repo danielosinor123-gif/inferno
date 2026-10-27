@@ -7,6 +7,8 @@ description = "Benchmark harness for the inferno scheduler layer (threads, KV, b
 
 [dependencies]
 inferno-core = { path = "../inferno-core" }
+inferno-model = { path = "../inferno-model" }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
 [[bin]]
 name = "inferno-bench"
