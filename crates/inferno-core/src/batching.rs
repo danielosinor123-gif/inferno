@@ -336,6 +336,7 @@ impl Batcher {
             let pos_before = seq.pos;
             let processed = engine.prefill_chunk(seq, &mut cache, budget);
             budget = budget.saturating_sub(processed);
+            out.prefill_tokens += processed;
             let pos_after = seq.pos;
             let prompt_len = seq.prompt.len();
             if processed == 0 && pos_after < prompt_len {

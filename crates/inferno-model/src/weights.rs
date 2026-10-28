@@ -74,17 +74,11 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits(bits32)
 }
 
-fn fp16_slice_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect()
-}
-
 /// Read one tensor as f32, converting bf16/fp16 on the fly, validating the
-/// exact safetensors shape. Shape validation matters because several weight
-/// matrices are square ([h, h], [h, qd] vs [qd, h]) — a length-only check
-/// would silently accept a transposed checkpoint and scramble the math.
+/// exact safetensors shape. Writes DIRECTLY into an exact-size buffer — no
+/// `.collect()` (iterator collect cannot pre-size, so a 544 MB tensor
+/// transiently costs up to ~1.4 GB in growth-copies; on a 4 GB VM under host
+/// memory pressure that spike is what gets the whole machine killed).
 fn tensor_to_f32(st: &SafeTensors, name: &str, want: &[usize]) -> Result<Vec<f32>, String> {
     let t = st
         .tensor(name)
@@ -95,20 +89,31 @@ fn tensor_to_f32(st: &SafeTensors, name: &str, want: &[usize]) -> Result<Vec<f32
             "tensor {name}: shape {sh:?} != expected {want:?}"
         ));
     }
+    let n: usize = want.iter().product();
+    let mut out = vec![0.0f32; n];
     match t.dtype() {
-        Dtype::BF16 => Ok(t
-            .data()
-            .chunks_exact(2)
-            .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()),
-        Dtype::F16 => Ok(fp16_slice_to_f32(t.data())),
-        Dtype::F32 => Ok(t
-            .data()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()),
-        other => Err(format!("tensor {name}: unsupported dtype {other:?} (need fp16/fp32)")),
+        Dtype::BF16 => {
+            for (c, o) in t.data().chunks_exact(2).zip(out.iter_mut()) {
+                *o = bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            }
+        }
+        Dtype::F16 => {
+            for (c, o) in t.data().chunks_exact(2).zip(out.iter_mut()) {
+                *o = f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            }
+        }
+        Dtype::F32 => {
+            for (c, o) in t.data().chunks_exact(4).zip(out.iter_mut()) {
+                *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        other => {
+            return Err(format!(
+                "tensor {name}: unsupported dtype {other:?} (need bf16/fp16/fp32)"
+            ))
+        }
     }
+    Ok(out)
 }
 
 impl QwenWeights {

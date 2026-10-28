@@ -518,6 +518,21 @@ impl Engine for QwenEngine {
     fn prefill_chunk(&mut self, seq: &mut Sequence, cache: &mut KvCache, budget: usize) -> usize {
         let end = (seq.pos + budget).min(seq.prompt.len());
         let mut processed = 0usize;
+        // Fully-reused prompt (every block prefix-cached): no token needs a
+        // forward for KV, but the next-token logits for the LAST prompt token
+        // are transient — they exist only in the round that computed them.
+        // Re-forward that one token to restash logits. The KV this produces is
+        // bit-identical to what the cache already holds, so the batcher skips
+        // the write (no CoW on the shared blocks).
+        if seq.pos >= end && end == seq.prompt.len() && !seq.prompt.is_empty() {
+            let pos = seq.prompt.len() - 1;
+            let tok = seq.prompt[pos];
+            let mut kv = Vec::new();
+            let x = self.forward_token(tok, pos, cache, seq.id, &mut kv);
+            let logits = self.logits_of(&x);
+            self.stash.insert(seq.id, Stash { logits, logits_pos: pos });
+            return 0;
+        }
         while seq.pos < end {
             let tok = seq.prompt[seq.pos];
             let pos = seq.pos;

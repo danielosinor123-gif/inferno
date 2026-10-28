@@ -395,7 +395,7 @@ fn cmd_overhead() {
 
 /// Instrumented drain: per-step trace on stderr (unbuffered), livelock guard,
 /// hard step cap. Returns nothing; the batcher accumulates metrics.
-fn drain_traced(b: &mut Batcher, e: &mut QwenEngine, adm: &dyn Admission) {
+fn drain_traced(b: &mut Batcher, e: &mut QwenEngine, adm: &dyn Admission, quiet: bool) {
     let mut steps = 0usize;
     let mut idle = 0usize;
     loop {
@@ -413,10 +413,12 @@ fn drain_traced(b: &mut Batcher, e: &mut QwenEngine, adm: &dyn Admission) {
             }
         } else {
             idle = 0;
-            eprintln!(
-                "  [trace] step {steps}: admitted {} prefill {} decode {} preempt {}",
-                r.admitted, r.prefill_tokens, r.decode_tokens, r.preempted
-            );
+            if !quiet {
+                eprintln!(
+                    "  [trace] step {steps}: admitted {} prefill {} decode {} preempt {}",
+                    r.admitted, r.prefill_tokens, r.decode_tokens, r.preempted
+                );
+            }
         }
         if steps >= 200_000 {
             eprintln!("  [trace] STEP CAP HIT — aborting drain");
@@ -424,6 +426,165 @@ fn drain_traced(b: &mut Batcher, e: &mut QwenEngine, adm: &dyn Admission) {
         }
     }
     eprintln!("  [trace] drain done: {steps} steps");
+}
+
+/// Machine-state snapshot for outlier detection: a mid-benchmark VM restart
+/// (uptime discontinuity) or host memory pressure shows up here, not as a
+/// silent lie in the numbers.
+fn machine_state() -> String {
+    let up = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let up = up.split_whitespace().next().unwrap_or("?").to_string();
+    let la = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let la = la.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let avail = mem
+        .lines()
+        .find(|l| l.starts_with("MemAvailable"))
+        .and_then(|l| l.split_whitespace().nth(1).map(|s| s.to_string()))
+        .unwrap_or_else(|| "?".into());
+    format!("uptime_s={up} loadavg=({la}) mem_avail_kb={avail}")
+}
+
+/// Real-model benchmark: synthetic prompts (valid token ids, no semantics —
+/// performance only), per-request CSV rows appended to --csv, machine state
+/// logged per rep. Two submission modes:
+///   default      conc requests submitted together, per-rep FRESH prompt
+///                (seed advances per rep, so rep 2+ never reuses rep 1's
+///                registered prefix — cold prefill every rep);
+///   --stagger 1  the SAME prompt every round, submitted sequentially —
+///                rounds 2+ measure warm TTFT via the retained prefix cache.
+fn cmd_bench(admission: std::sync::Arc<dyn Admission>, sched_label: &str) {
+    use std::io::Write;
+    let a = args();
+    let dir = flag(&a, "--model-dir", "/root/models/qwen2.5-0.5b");
+    let prompt_len: usize = flag(&a, "--prompt-len", "32").parse().unwrap_or(32);
+    let max_gen: usize = flag(&a, "--max-gen", "16").parse().unwrap_or(16);
+    let conc: usize = flag(&a, "--conc", "1").parse().unwrap_or(1);
+    let reps: usize = flag(&a, "--reps", "1").parse().unwrap_or(1);
+    let stagger: bool = flag(&a, "--stagger", "0") == "1";
+    let blocks: usize = flag(&a, "--blocks", "256").parse().unwrap_or(256);
+    let chunk: usize = flag(&a, "--chunk", "64").parse().unwrap_or(64);
+    let tag = flag(&a, "--tag", "w");
+    let csv = flag(&a, "--csv", "");
+    let seed: u64 = flag(&a, "--seed", "42").parse().unwrap_or(42);
+
+    println!("bench mode — loading {dir} ...");
+    let mut engine = QwenEngine::load(std::path::Path::new(&dir)).expect("model load failed");
+    let cfg = engine.cfg.clone();
+    let mut batcher = Batcher::new(
+        KvConfig {
+            block_size: 16,
+            num_blocks: blocks,
+            num_layers: cfg.num_layers,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+        },
+        BatcherConfig {
+            prefill_chunk_tokens: chunk,
+            max_num_seqs: 8,
+        },
+    );
+    eprintln!("[bench] sched={sched_label} {}", machine_state());
+
+    let mut csv_file = if csv.is_empty() {
+        None
+    } else {
+        let new = !std::path::Path::new(&csv).exists()
+            || std::fs::metadata(&csv).map(|m| m.len() == 0).unwrap_or(true);
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&csv)
+            .expect("csv open failed");
+        if new {
+            let mut f = f;
+            writeln!(
+                f,
+                "kind,tag,rep,id,prompt_len,gen_len,ttft_ms,tpot_ms,reuse,preempt,wall_s,tokens,uptime_s"
+            )
+            .unwrap();
+            Some(f)
+        } else {
+            Some(f)
+        }
+    };
+
+    let mut st = seed;
+    for rep in 0..reps {
+        // Non-stagger: fresh prompt per rep so no rep inherits another's
+        // registered prefix (cold prefill is the thing being measured).
+        // Stagger: identical prompt — the reuse IS the measurement.
+        let prompt: Vec<u32> = if stagger {
+            let mut s2 = seed;
+            (0..prompt_len)
+                .map(|_| (xorshift(&mut s2) % 100_000) as u32 + 100)
+                .collect()
+        } else {
+            (0..prompt_len)
+                .map(|_| (xorshift(&mut st) % 100_000) as u32 + 100)
+                .collect()
+        };
+        eprintln!("[bench] rep {rep} start {}", machine_state());
+        let t0 = Instant::now();
+        let mut ids = Vec::new();
+        if stagger {
+            for _ in 0..conc {
+                let id = batcher.submit(Submit {
+                    prompt: prompt.clone(),
+                    max_gen,
+                    priority: Priority::Normal,
+                    ttft_slo_ms: 60_000.0,
+                });
+                ids.push(id);
+                drain_traced(&mut batcher, &mut engine, admission.as_ref(), true);
+            }
+        } else {
+            for _ in 0..conc {
+                ids.push(batcher.submit(Submit {
+                    prompt: prompt.clone(),
+                    max_gen,
+                    priority: Priority::Normal,
+                    ttft_slo_ms: 60_000.0,
+                }));
+            }
+            drain_traced(&mut batcher, &mut engine, admission.as_ref(), true);
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        let tokens: usize = ids
+            .iter()
+            .filter_map(|id| batcher.metrics().iter().find(|m| m.id == *id))
+            .map(|m| m.gen_len)
+            .sum();
+        let uptime = machine_state();
+        eprintln!("[bench] rep {rep} done wall={wall:.2}s tokens={tokens} {uptime}");
+        let uptime_s: String = uptime
+            .split("uptime_s=")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        for id in &ids {
+            if let Some(m) = batcher.metrics().iter().find(|m| m.id == *id) {
+                let row = format!(
+                    "R,{},{},{},{},{},{:.1},{:.1},{},{},,,{}",
+                    tag, rep, m.id, m.prompt_len, m.gen_len,
+                    m.ttft_us / 1e3, m.tpot_us / 1e3, m.reused_blocks, m.preempted, uptime_s
+                );
+                println!("{row}");
+                if let Some(f) = csv_file.as_mut() {
+                    writeln!(f, "{row}").unwrap();
+                }
+            }
+        }
+        if let Some(f) = csv_file.as_mut() {
+            writeln!(
+                f,
+                "S,{},{},{},{},{},{},{},{},{},{},{:.2},{},{}",
+                tag, rep, "", "", "", "", "", "", "", "", wall, tokens, uptime_s
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
@@ -480,7 +641,7 @@ fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
             max_num_seqs: 8,
         },
     );
-    let id = batcher.submit(Submit {
+    let _id = batcher.submit(Submit {
         prompt: prompt_ids.clone(),
         max_gen,
         priority: Priority::Normal,
@@ -506,7 +667,7 @@ fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
                 ttft_slo_ms: 10_000.0,
             });
             eprintln!("  [trace] round {r}: submitted id {id}");
-            drain_traced(&mut batcher, &mut engine, admission.as_ref());
+            drain_traced(&mut batcher, &mut engine, admission.as_ref(), false);
         }
     } else {
         for _ in 0..repeats {
@@ -517,7 +678,7 @@ fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
                 ttft_slo_ms: 10_000.0,
             });
         }
-        drain_traced(&mut batcher, &mut engine, admission.as_ref());
+        drain_traced(&mut batcher, &mut engine, admission.as_ref(), false);
     }
     let wall = t0.elapsed();
     println!("  drained in {:.2} s", wall.as_secs_f64());
@@ -594,12 +755,14 @@ fn main() {
         "load" => cmd_load(admission, label),
         "overhead" => cmd_overhead(),
         "model" => cmd_model(admission),
+        "bench" => cmd_bench(admission, label),
         "tok" => cmd_tok(),
         _ => {
-            eprintln!("usage: inferno-bench [load|threads|model|overhead] [options]");
+            eprintln!("usage: inferno-bench [load|threads|model|bench|overhead] [options]");
             eprintln!("  load: --requests N --max-gen N --prompt-min N --prompt-max N --chunk N --seqs N [--tag-interactive]");
             eprintln!("  threads: --threads N");
             eprintln!("  model: --model-dir PATH [--prompt TEXT] [--max-gen N] [--blocks N]");
+            eprintln!("  bench: --prompt-len N --max-gen N --conc N --reps N [--stagger 1] --tag NAME --csv PATH");
             eprintln!("  tok: (no options) direct tokenizers-crate probe");
             std::process::exit(2);
         }
