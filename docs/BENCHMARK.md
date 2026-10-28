@@ -156,14 +156,18 @@ S,W3reuse,3,,,,,,,,,13.28,8,327.69
 
 ## Fireworks contextual comparison (honest)
 
-Fireworks serves Qwen2.5-0.5B on H100-class fleets at publicly typical
-TPOT ≈ 10–30 ms/token. This CPU v1 measures 1.6–1.9 s/token — **50–150× slower
-per token**. The compute race was never the claim (pre-registered above).
+Superseded numbers as of the threading + bf16-storage steps (docs/THREADING.md,
+docs/WEIGHTS16.md): single-stream TPOT is now **733 ms/token** (W6bf16b, 4
+workers, bf16 weights), down from the 1.65 s v1 baseline above. Fireworks
+serves Qwen2.5-0.5B on H100-class fleets at publicly typical TPOT ≈ 10–30 ms —
+inferno remains ~25–70× slower per token on this hardware. The compute race was
+never the claim.
 
-The comparison that matters for inferno's positioning: on hardware you already
-own — this laptop, while the host was *itself* memory-starved — inferno
-delivered correct serving, deterministic generation, all-or-nothing admission
-under pressure (0 preemptions in every completed run), and a 28× TTFT win on
-repeated prompts via retained-KV prefix caching. Fireworks cannot serve on
-your laptop at all. That is the race inferno is in.
+What inferno brings on hardware you already own — this laptop, while the host
+was *itself* memory-starved: correct, deterministic serving (generation ids
+identical across engine versions and cold/warm paths), all-or-nothing admission
+under pressure (0 preemptions in every completed run), a 28× TTFT win on
+repeated prompts via retained-KV prefix caching, and 2-way batching at ~zero
+marginal cost. Fireworks cannot serve on your laptop at all. That is the race
+inferno is in.
 

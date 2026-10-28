@@ -26,7 +26,7 @@ use inferno_core::kernels::{paged_attention_self, rmsnorm, rope};
 use inferno_core::kv_cache::KvCache;
 
 use crate::config::ModelCfg;
-use crate::weights::QwenWeights;
+use crate::weights::{QwenWeights, WeightMat};
 
 /// Contiguous-row gemv: `out[j] = dot(w_row_j, x)` for j in 0..rows.
 /// `w` is `[rows, x.len()]` row-major (native HF layout) — the inner loop is
@@ -117,33 +117,32 @@ impl QwenEngine {
     }
 
     /// Contiguous-row gemv with the pool when available. Row-parallel by
-    /// construction: each worker computes whole rows with the SAME sequential
-    /// inner-loop summation order as the scalar path, and `map_chunks`
-    /// returns results in chunk (= row) order — bit-identical outputs, no
-    /// reduction-order changes (the threading step's correctness gate).
-    fn gemv_rows(&self, mat: &std::sync::Arc<Vec<f32>>, x: &[f32], rows: usize, out: &mut [f32]) {
+    /// construction: each worker computes whole rows with the SAME per-row
+    /// summation order as the scalar path, and `map_chunks` returns results
+    /// in chunk (= row) order — bit-identical outputs, no reduction-order
+    /// changes (the threading step's correctness gate). Weights stay in
+    /// their native dtype (bf16 halved bytes, docs/WEIGHTS16.md); conversion
+    /// happens per element inside the unchanged dot.
+    fn gemv_rows<'a>(&self, mat: &'a WeightMat, x: &[f32], rows: usize, out: &mut [f32]) {
         debug_assert_eq!(out.len(), rows);
         let Some(pool) = self.pool.as_ref() else {
-            gemv(mat, x, rows, out);
+            for j in 0..rows {
+                out[j] = mat.dot_row(j, x, x.len());
+            }
             return;
         };
         let k = x.len();
-        let mat = std::sync::Arc::clone(mat);
-        // `x` copied (<= 4864 floats): closures need 'static captures, and
-        // this copy is noise next to the gemv it feeds.
+        // 'static captures for map_chunks: Arc-clone the matrix (bump a
+        // refcount) and copy x (<= 4864 floats — noise next to the gemv).
+        let mat: WeightMat = match mat {
+            WeightMat::F32(v) => WeightMat::F32(std::sync::Arc::clone(v)),
+            WeightMat::BF16(v) => WeightMat::BF16(std::sync::Arc::clone(v)),
+            WeightMat::F16(v) => WeightMat::F16(std::sync::Arc::clone(v)),
+        };
         let xc = x.to_vec();
         let idx: Vec<usize> = (0..rows).collect();
         let parts: Vec<Vec<f32>> = pool.map_chunks(idx, move |js, _id| {
-            js.iter()
-                .map(|&j| {
-                    let row = &mat[j * k..j * k + k];
-                    let mut s = 0.0f32;
-                    for i in 0..k {
-                        s += row[i] * xc[i];
-                    }
-                    s
-                })
-                .collect::<Vec<f32>>()
+            js.iter().map(|&j| mat.dot_row(j, &xc, k)).collect::<Vec<f32>>()
         });
         let mut o = 0usize;
         for p in parts {
@@ -205,7 +204,7 @@ impl QwenEngine {
         let inter = self.cfg.intermediate;
 
         let e = tok as usize;
-        let mut x = self.w.embed[e * h..e * h + h].to_vec();
+        let mut x: Vec<f32> = (0..h).map(|i| self.w.embed.at(e * h + i)).collect();
         let mut h1 = vec![0.0f32; h];
         let mut q = vec![0.0f32; qd];
         let mut k = vec![0.0f32; kvd];
@@ -322,7 +321,7 @@ impl QwenEngine {
 mod tests {
     use super::*;
     use crate::config::ModelCfg;
-    use crate::weights::LayerWeights;
+    use crate::weights::{LayerWeights, WeightMat};
 
     fn tiny_cfg() -> ModelCfg {
         ModelCfg {
@@ -348,13 +347,31 @@ mod tests {
             (0..rows * cols).map(|k| f(k + salt, salt * 7 + k / cols.max(1))).collect()
         };
         QwenWeights {
-            embed: std::sync::Arc::new(fill(cfg.vocab, cfg.hidden, 0)),
+            // bf16 storage (the real checkpoint's dtype): the reference gate
+            // now compares the PARALLEL BF16 engine vs a scalar BF16 reference.
+            embed: crate::weights::bf16_from_f32(fill(cfg.vocab, cfg.hidden, 0)),
             layers: (0..cfg.num_layers)
                 .map(|l| LayerWeights {
-                    q: std::sync::Arc::new(fill(cfg.num_q_heads * cfg.head_dim, cfg.hidden, 10 + l)),
-                    k: std::sync::Arc::new(fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 20 + l)),
-                    v: std::sync::Arc::new(fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 30 + l)),
-                    o: std::sync::Arc::new(fill(cfg.hidden, cfg.num_q_heads * cfg.head_dim, 40 + l)),
+                    q: crate::weights::bf16_from_f32(fill(
+                        cfg.num_q_heads * cfg.head_dim,
+                        cfg.hidden,
+                        10 + l,
+                    )),
+                    k: crate::weights::bf16_from_f32(fill(
+                        cfg.num_kv_heads * cfg.head_dim,
+                        cfg.hidden,
+                        20 + l,
+                    )),
+                    v: crate::weights::bf16_from_f32(fill(
+                        cfg.num_kv_heads * cfg.head_dim,
+                        cfg.hidden,
+                        30 + l,
+                    )),
+                    o: crate::weights::bf16_from_f32(fill(
+                        cfg.hidden,
+                        cfg.num_q_heads * cfg.head_dim,
+                        40 + l,
+                    )),
                     qb: std::sync::Arc::new(
                         (0..cfg.num_q_heads * cfg.head_dim)
                             .map(|i| f(i, 91 + l) * 0.05)
@@ -370,9 +387,9 @@ mod tests {
                             .map(|i| f(i, 93 + l) * 0.05)
                             .collect(),
                     ),
-                    gate: std::sync::Arc::new(fill(cfg.intermediate, cfg.hidden, 50 + l)),
-                    up: std::sync::Arc::new(fill(cfg.intermediate, cfg.hidden, 60 + l)),
-                    down: std::sync::Arc::new(fill(cfg.hidden, cfg.intermediate, 70 + l)),
+                    gate: crate::weights::bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 50 + l)),
+                    up: crate::weights::bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 60 + l)),
+                    down: crate::weights::bf16_from_f32(fill(cfg.hidden, cfg.intermediate, 70 + l)),
                     norm_in: std::sync::Arc::new(
                         (0..cfg.hidden).map(|i| 1.0 + f(i, l) * 0.1).collect(),
                     ),
@@ -405,7 +422,7 @@ mod tests {
         let qd = qh * d;
         let kvd = kvh_n * d;
         let group = qh / kvh_n;
-        let mut x: Vec<f32> = w.embed[tok as usize * h..tok as usize * h + h].to_vec();
+        let mut x: Vec<f32> = (0..h).map(|i| w.embed.at(tok as usize * h + i)).collect();
         kv_out.clear();
         for li in 0..l {
             let lw = &w.layers[li];
@@ -415,16 +432,10 @@ mod tests {
             let hn: Vec<f32> =
                 x.iter().zip(lw.norm_in.iter()).map(|(v, g)| v / rms * g).collect();
             // projections
-            let proj = |mat: &[f32], inp: &[f32], rows: usize| -> Vec<f32> {
-                let k = inp.len();
-                (0..rows)
-                    .map(|j| {
-                        let row = &mat[j * k..j * k + k];
-                        row.iter().zip(inp).map(|(a, b)| a * b).sum::<f32>()
-                    })
-                    .collect()
+            let proj = |mat: &WeightMat, inp: &[f32], rows: usize| -> Vec<f32> {
+                (0..rows).map(|j| mat.dot_row(j, inp, inp.len())).collect()
             };
-            let projb = |mat: &[f32], bias: &[f32], inp: &[f32], rows: usize| -> Vec<f32> {
+            let projb = |mat: &WeightMat, bias: &[f32], inp: &[f32], rows: usize| -> Vec<f32> {
                 let mut v = proj(mat, inp, rows);
                 for (o, &b) in v.iter_mut().zip(bias.iter()) {
                     *o += b;
@@ -510,10 +521,8 @@ mod tests {
         let xn: Vec<f32> = x.iter().zip(w.norm.iter()).map(|(v, g)| v / rms * g).collect();
         (0..cfg.vocab)
             .map(|j| {
-                w.embed[j * h..j * h + h]
-                    .iter()
-                    .zip(&xn)
-                    .map(|(a, b)| a * b)
+                (0..h)
+                    .map(|i| w.embed.at(j * h + i) * xn[i])
                     .sum::<f32>()
             })
             .collect()
