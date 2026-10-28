@@ -484,7 +484,11 @@ fn cmd_bench(admission: std::sync::Arc<dyn Admission>, sched_label: &str) {
             max_num_seqs: 8,
         },
     );
-    eprintln!("[bench] sched={sched_label} {}", machine_state());
+    eprintln!(
+        "[bench] sched={sched_label} gemv_workers={} {}",
+        engine.pool_workers(),
+        machine_state()
+    );
 
     let mut csv_file = if csv.is_empty() {
         None

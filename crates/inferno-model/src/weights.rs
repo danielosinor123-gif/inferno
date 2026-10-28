@@ -5,36 +5,39 @@ use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::config::ModelCfg;
 
 pub struct LayerWeights {
     /// self_attn projections, native [out, in] row-major layout.
-    pub q: Vec<f32>,
-    pub k: Vec<f32>,
-    pub v: Vec<f32>,
-    pub o: Vec<f32>,
+    /// Arc'd: immutable after load, shared into the row-parallel gemv pool
+    /// (docs/THREADING.md — `map_chunks` requires 'static captures).
+    pub q: Arc<Vec<f32>>,
+    pub k: Arc<Vec<f32>>,
+    pub v: Arc<Vec<f32>>,
+    pub o: Arc<Vec<f32>>,
     /// QKV bias — Qwen2.5 adds bias to q/k/v projections (72 bias tensors
     /// confirmed in the checkpoint header). o_proj and the MLP have none.
-    pub qb: Vec<f32>,
-    pub kb: Vec<f32>,
-    pub vb: Vec<f32>,
+    pub qb: Arc<Vec<f32>>,
+    pub kb: Arc<Vec<f32>>,
+    pub vb: Arc<Vec<f32>>,
     /// MLP (SwiGLU): down(silu(gate(x)) * up(x))
-    pub gate: Vec<f32>,
-    pub up: Vec<f32>,
-    pub down: Vec<f32>,
+    pub gate: Arc<Vec<f32>>,
+    pub up: Arc<Vec<f32>>,
+    pub down: Arc<Vec<f32>>,
     /// RMSNorm gains.
-    pub norm_in: Vec<f32>,
-    pub norm_post: Vec<f32>,
+    pub norm_in: Arc<Vec<f32>>,
+    pub norm_post: Arc<Vec<f32>>,
 }
 
 pub struct QwenWeights {
     /// Token embedding [vocab, hidden]; doubles as lm_head when weights are
     /// tied (Qwen2.5-0.5B: tie_word_embeddings = true).
-    pub embed: Vec<f32>,
+    pub embed: Arc<Vec<f32>>,
     pub layers: Vec<LayerWeights>,
     /// Final RMSNorm gain [hidden].
-    pub norm: Vec<f32>,
+    pub norm: Arc<Vec<f32>>,
     pub tied_head: bool,
 }
 
@@ -155,7 +158,7 @@ impl QwenWeights {
             // NOTE: closure borrows `st` (no move) — moving would consume the
             // deserialized index on the first iteration.
             let p = |n: &str, want: &[usize]| {
-                tensor_to_f32(&st, &format!("model.layers.{i}.{n}"), want)
+                tensor_to_f32(&st, &format!("model.layers.{i}.{n}"), want).map(Arc::new)
             };
             let w = LayerWeights {
                 q: p("self_attn.q_proj.weight", &[qd, h])?,
@@ -204,9 +207,9 @@ impl QwenWeights {
         Ok((
             cfg,
             Self {
-                embed,
+                embed: Arc::new(embed),
                 layers,
-                norm,
+                norm: Arc::new(norm),
                 tied_head,
             },
         ))

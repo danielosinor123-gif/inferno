@@ -69,6 +69,17 @@ pub struct QwenEngine {
     pub w: QwenWeights,
     tok: Option<tokenizers::Tokenizer>,
     stash: HashMap<u64, Stash>,
+    /// Row-parallel gemv pool (threading step, pre-registered in
+    /// docs/THREADING.md). None = scalar path (tests, tiny models).
+    pool: Option<inferno_core::threads::ThreadPool>,
+}
+
+fn make_pool() -> Option<inferno_core::threads::ThreadPool> {
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if n <= 1 {
+        return None;
+    }
+    inferno_core::threads::ThreadPool::new(Some(n)).ok()
 }
 
 impl QwenEngine {
@@ -78,6 +89,9 @@ impl QwenEngine {
             w,
             tok: None,
             stash: HashMap::new(),
+            // Pool by default so tests exercise the parallel path (the
+            // reference test's bit-identical gate then covers threading).
+            pool: make_pool(),
         }
     }
 
@@ -93,7 +107,50 @@ impl QwenEngine {
             w,
             tok: Some(tok),
             stash: HashMap::new(),
+            pool: make_pool(),
         })
+    }
+
+    /// Workers in the gemv pool (0 = scalar path). Diagnostics.
+    pub fn pool_workers(&self) -> usize {
+        self.pool.as_ref().map(|p| p.workers()).unwrap_or(0)
+    }
+
+    /// Contiguous-row gemv with the pool when available. Row-parallel by
+    /// construction: each worker computes whole rows with the SAME sequential
+    /// inner-loop summation order as the scalar path, and `map_chunks`
+    /// returns results in chunk (= row) order — bit-identical outputs, no
+    /// reduction-order changes (the threading step's correctness gate).
+    fn gemv_rows(&self, mat: &std::sync::Arc<Vec<f32>>, x: &[f32], rows: usize, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), rows);
+        let Some(pool) = self.pool.as_ref() else {
+            gemv(mat, x, rows, out);
+            return;
+        };
+        let k = x.len();
+        let mat = std::sync::Arc::clone(mat);
+        // `x` copied (<= 4864 floats): closures need 'static captures, and
+        // this copy is noise next to the gemv it feeds.
+        let xc = x.to_vec();
+        let idx: Vec<usize> = (0..rows).collect();
+        let parts: Vec<Vec<f32>> = pool.map_chunks(idx, move |js, _id| {
+            js.iter()
+                .map(|&j| {
+                    let row = &mat[j * k..j * k + k];
+                    let mut s = 0.0f32;
+                    for i in 0..k {
+                        s += row[i] * xc[i];
+                    }
+                    s
+                })
+                .collect::<Vec<f32>>()
+        });
+        let mut o = 0usize;
+        for p in parts {
+            out[o..o + p.len()].copy_from_slice(&p);
+            o += p.len();
+        }
+        debug_assert_eq!(o, rows);
     }
 
     /// Tokenize a prompt (special tokens per the tokenizer config).
@@ -162,18 +219,18 @@ impl QwenEngine {
         for li in 0..l {
             let w = &self.w.layers[li];
             rmsnorm(&x, &w.norm_in, self.cfg.rms_eps, &mut h1);
-            gemv(&w.q, &h1, qd, &mut q);
-            gemv(&w.k, &h1, kvd, &mut k);
-            gemv(&w.v, &h1, kvd, &mut v);
+            self.gemv_rows(&w.q, &h1, qd, &mut q);
+            self.gemv_rows(&w.k, &h1, kvd, &mut k);
+            self.gemv_rows(&w.v, &h1, kvd, &mut v);
             // Qwen2.5 QKV bias (tensors exist in the checkpoint — verified
             // against the safetensors header)
-            for (qv, &b) in q.iter_mut().zip(&w.qb) {
+            for (qv, &b) in q.iter_mut().zip(w.qb.iter()) {
                 *qv += b;
             }
-            for (kv, &b) in k.iter_mut().zip(&w.kb) {
+            for (kv, &b) in k.iter_mut().zip(w.kb.iter()) {
                 *kv += b;
             }
-            for (vv, &b) in v.iter_mut().zip(&w.vb) {
+            for (vv, &b) in v.iter_mut().zip(w.vb.iter()) {
                 *vv += b;
             }
             rope(&mut q, self.cfg.num_q_heads, d, pos, self.cfg.rope_theta);
@@ -186,14 +243,14 @@ impl QwenEngine {
             paged_attention_self(
                 cache, seq_id, li, &q, self.cfg.num_q_heads, d, pos, &k, &v, &mut attn,
             );
-            gemv(&w.o, &attn, h, &mut h1); // o_proj output
+            self.gemv_rows(&w.o, &attn, h, &mut h1); // o_proj output
             for i in 0..h {
                 x[i] += h1[i];
             }
 
             rmsnorm(&x, &w.norm_post, self.cfg.rms_eps, &mut h1);
-            gemv(&w.gate, &h1, inter, &mut gate);
-            gemv(&w.up, &h1, inter, &mut up);
+            self.gemv_rows(&w.gate, &h1, inter, &mut gate);
+            self.gemv_rows(&w.up, &h1, inter, &mut up);
             // SwiGLU: down(silu(gate) * up)
             for i in 0..inter {
                 let g = gate[i];
@@ -202,7 +259,7 @@ impl QwenEngine {
             for i in 0..inter {
                 gate[i] *= up[i];
             }
-            gemv(&w.down, &gate, h, &mut h1);
+            self.gemv_rows(&w.down, &gate, h, &mut h1);
             for i in 0..h {
                 x[i] += h1[i];
             }
@@ -211,20 +268,15 @@ impl QwenEngine {
     }
 
     /// Final RMSNorm + lm_head (row-dot over the embedding matrix when tied).
+    /// The lm_head is the largest gemv in the stack ([vocab, hidden] — 151936x896
+    /// for the 0.5B), so it goes through the same row-parallel path.
     fn logits_of(&self, x: &[f32]) -> Vec<f32> {
         debug_assert!(self.w.tied_head, "v1 supports tied lm_head only");
         let h = self.cfg.hidden;
         let mut xn = vec![0.0f32; h];
         rmsnorm(x, &self.w.norm, self.cfg.rms_eps, &mut xn);
         let mut logits = vec![0.0f32; self.cfg.vocab];
-        for j in 0..self.cfg.vocab {
-            let row = &self.w.embed[j * h..j * h + h];
-            let mut s = 0.0f32;
-            for i in 0..h {
-                s += row[i] * xn[i];
-            }
-            logits[j] = s;
-        }
+        self.gemv_rows(&self.w.embed, &xn, self.cfg.vocab, &mut logits);
         logits
     }
 
@@ -296,30 +348,42 @@ mod tests {
             (0..rows * cols).map(|k| f(k + salt, salt * 7 + k / cols.max(1))).collect()
         };
         QwenWeights {
-            embed: fill(cfg.vocab, cfg.hidden, 0),
+            embed: std::sync::Arc::new(fill(cfg.vocab, cfg.hidden, 0)),
             layers: (0..cfg.num_layers)
                 .map(|l| LayerWeights {
-                    q: fill(cfg.num_q_heads * cfg.head_dim, cfg.hidden, 10 + l),
-                    k: fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 20 + l),
-                    v: fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 30 + l),
-                    o: fill(cfg.hidden, cfg.num_q_heads * cfg.head_dim, 40 + l),
-                    qb: (0..cfg.num_q_heads * cfg.head_dim)
-                        .map(|i| f(i, 91 + l) * 0.05)
-                        .collect(),
-                    kb: (0..cfg.num_kv_heads * cfg.head_dim)
-                        .map(|i| f(i, 92 + l) * 0.05)
-                        .collect(),
-                    vb: (0..cfg.num_kv_heads * cfg.head_dim)
-                        .map(|i| f(i, 93 + l) * 0.05)
-                        .collect(),
-                    gate: fill(cfg.intermediate, cfg.hidden, 50 + l),
-                    up: fill(cfg.intermediate, cfg.hidden, 60 + l),
-                    down: fill(cfg.hidden, cfg.intermediate, 70 + l),
-                    norm_in: (0..cfg.hidden).map(|i| 1.0 + f(i, l) * 0.1).collect(),
-                    norm_post: (0..cfg.hidden).map(|i| 1.0 + f(i, l + 3) * 0.1).collect(),
+                    q: std::sync::Arc::new(fill(cfg.num_q_heads * cfg.head_dim, cfg.hidden, 10 + l)),
+                    k: std::sync::Arc::new(fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 20 + l)),
+                    v: std::sync::Arc::new(fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 30 + l)),
+                    o: std::sync::Arc::new(fill(cfg.hidden, cfg.num_q_heads * cfg.head_dim, 40 + l)),
+                    qb: std::sync::Arc::new(
+                        (0..cfg.num_q_heads * cfg.head_dim)
+                            .map(|i| f(i, 91 + l) * 0.05)
+                            .collect(),
+                    ),
+                    kb: std::sync::Arc::new(
+                        (0..cfg.num_kv_heads * cfg.head_dim)
+                            .map(|i| f(i, 92 + l) * 0.05)
+                            .collect(),
+                    ),
+                    vb: std::sync::Arc::new(
+                        (0..cfg.num_kv_heads * cfg.head_dim)
+                            .map(|i| f(i, 93 + l) * 0.05)
+                            .collect(),
+                    ),
+                    gate: std::sync::Arc::new(fill(cfg.intermediate, cfg.hidden, 50 + l)),
+                    up: std::sync::Arc::new(fill(cfg.intermediate, cfg.hidden, 60 + l)),
+                    down: std::sync::Arc::new(fill(cfg.hidden, cfg.intermediate, 70 + l)),
+                    norm_in: std::sync::Arc::new(
+                        (0..cfg.hidden).map(|i| 1.0 + f(i, l) * 0.1).collect(),
+                    ),
+                    norm_post: std::sync::Arc::new(
+                        (0..cfg.hidden).map(|i| 1.0 + f(i, l + 3) * 0.1).collect(),
+                    ),
                 })
                 .collect(),
-            norm: (0..cfg.hidden).map(|i| 1.0 + f(i, 99) * 0.1).collect(),
+            norm: std::sync::Arc::new(
+                (0..cfg.hidden).map(|i| 1.0 + f(i, 99) * 0.1).collect(),
+            ),
             tied_head: true,
         }
     }
@@ -349,7 +413,7 @@ mod tests {
             let rms: f32 =
                 (x.iter().map(|v| v * v).sum::<f32>() / h as f32 + cfg.rms_eps).sqrt();
             let hn: Vec<f32> =
-                x.iter().zip(&lw.norm_in).map(|(v, g)| v / rms * g).collect();
+                x.iter().zip(lw.norm_in.iter()).map(|(v, g)| v / rms * g).collect();
             // projections
             let proj = |mat: &[f32], inp: &[f32], rows: usize| -> Vec<f32> {
                 let k = inp.len();
@@ -362,7 +426,7 @@ mod tests {
             };
             let projb = |mat: &[f32], bias: &[f32], inp: &[f32], rows: usize| -> Vec<f32> {
                 let mut v = proj(mat, inp, rows);
-                for (o, &b) in v.iter_mut().zip(bias) {
+                for (o, &b) in v.iter_mut().zip(bias.iter()) {
                     *o += b;
                 }
                 v
@@ -424,7 +488,7 @@ mod tests {
             let rms2: f32 =
                 (x.iter().map(|v| v * v).sum::<f32>() / h as f32 + cfg.rms_eps).sqrt();
             let hn2: Vec<f32> =
-                x.iter().zip(&lw.norm_post).map(|(v, g)| v / rms2 * g).collect();
+                x.iter().zip(lw.norm_post.iter()).map(|(v, g)| v / rms2 * g).collect();
             let gate = proj(&lw.gate, &hn2, cfg.intermediate);
             let up = proj(&lw.up, &hn2, cfg.intermediate);
             let acted: Vec<f32> = gate
@@ -443,7 +507,7 @@ mod tests {
     fn ref_logits(cfg: &ModelCfg, w: &QwenWeights, x: &[f32]) -> Vec<f32> {
         let h = cfg.hidden;
         let rms: f32 = (x.iter().map(|v| v * v).sum::<f32>() / h as f32 + cfg.rms_eps).sqrt();
-        let xn: Vec<f32> = x.iter().zip(&w.norm).map(|(v, g)| v / rms * g).collect();
+        let xn: Vec<f32> = x.iter().zip(w.norm.iter()).map(|(v, g)| v / rms * g).collect();
         (0..cfg.vocab)
             .map(|j| {
                 w.embed[j * h..j * h + h]
