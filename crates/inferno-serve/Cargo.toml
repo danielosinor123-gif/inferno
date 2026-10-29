@@ -1,0 +1,15 @@
+[package]
+name = "inferno-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Engine HTTP service for inferno — the Rust side of the two-language boundary (ADR-001)"
+
+[dependencies]
+inferno-core = { path = "../inferno-core" }
+inferno-model = { path = "../inferno-model" }
+serde_json = "1"
+
+[[bin]]
+name = "inferno-serve"
+path = "src/main.rs"

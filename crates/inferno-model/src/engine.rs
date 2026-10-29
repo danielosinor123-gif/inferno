@@ -184,6 +184,12 @@ impl QwenEngine {
         }
     }
 
+    /// Whether this engine can detokenize (loaded via `load` with a
+    /// tokenizer; hermetic/demo engines built by `new` cannot).
+    pub fn has_tokenizer(&self) -> bool {
+        self.tok.is_some()
+    }
+
     /// Public wrapper over the one-token forward (tests, diagnostics; the
     /// batcher is the real caller). Builds nothing — the caller owns the cache.
     pub fn forward_token_pub(
@@ -442,10 +448,9 @@ impl QwenEngine {
     }
 }
 
-/// Test-only builders shared by engine and registry tests (hermetic: no
-/// files, no disk — tiny in-memory models).
-#[cfg(test)]
-pub(crate) mod testutil {
+/// Tiny in-memory model builders — hermetic gates across crates (no files,
+/// no disk), and the bootstrapping/demo engine. NOT a real model.
+pub mod demo {
     use super::*;
     use crate::config::ModelCfg;
     use crate::weights::{bf16_from_f32, LayerWeights};
@@ -550,7 +555,7 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{tiny_cfg, tiny_weights, tiny_weights_int8};
+    use super::demo::{tiny_cfg, tiny_weights, tiny_weights_int8};
     use super::*;
     use crate::weights::WeightMat;
 

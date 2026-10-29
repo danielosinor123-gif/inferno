@@ -259,7 +259,7 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{testutil, QwenEngine};
+    use crate::engine::{demo, QwenEngine};
     use inferno_core::kv_cache::{KvCache, KvConfig};
 
     fn kv() -> KvConfig {
@@ -273,7 +273,7 @@ mod tests {
     }
 
     fn tiny_loader() -> Loader {
-        Box::new(|| Ok(QwenEngine::new(testutil::tiny_cfg(), testutil::tiny_weights())))
+        Box::new(|| Ok(QwenEngine::new(demo::tiny_cfg(), demo::tiny_weights())))
     }
 
     fn reg_with(names: &[&str], budget: usize) -> ModelRegistry {
@@ -285,7 +285,7 @@ mod tests {
     }
 
     fn one_model_bytes() -> usize {
-        let eng = QwenEngine::new(testutil::tiny_cfg(), testutil::tiny_weights());
+        let eng = QwenEngine::new(demo::tiny_cfg(), demo::tiny_weights());
         eng.weight_bytes() + KvCache::pool_bytes(&kv())
     }
 
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn accounting_matches_storage_dtype() {
-        let eng = QwenEngine::new(testutil::tiny_cfg(), testutil::tiny_weights());
+        let eng = QwenEngine::new(demo::tiny_cfg(), demo::tiny_weights());
         let wb = eng.weight_bytes();
         // tiny model math: embed 32*8 bf16 = 512 B; per layer: matrices
         // (q 64 + k 32 + v 32 + o 64 + gate 48 + up 48 + down 48 = 336 elems
