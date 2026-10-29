@@ -80,12 +80,36 @@ impl WeightMat {
     }
 
     /// Row j of a [rows, k] matrix as f32 — the per-gemv-row accessor.
-    /// The dtype dispatch happens ONCE PER ROW (not per element — a per-
-    /// element match blocks auto-vectorization of the inner loop, measured
-    /// 12-50% slower in W6). Each inner loop stays sequential in i, so
-    /// results are bit-identical to the f32 path on identical values.
+    /// Dispatch order (all decided once per row, never per element):
+    ///   1. AVX2+FMA when detected (docs/DOTFMA.md) — 8-lane FMA reduction
+    ///      (deterministic lane order; differs from scalar by rounding, so
+    ///      the gates are tolerance-based equivalence, not bit-identity);
+    ///   2. scalar loops otherwise (reference path, non-x86, no-AVX2).
     #[inline]
     pub fn dot_row(&self, j: usize, x: &[f32], k: usize) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Scalar is the DEFAULT: LLVM auto-vectorizes these loops and
+            // beat the hand-written AVX2 path 2x in the paired A/B
+            // (docs/DOTFMA.md gate 3). The explicit path survives as an
+            // opt-in experiment (INFERNO_SIMD=1) — it is tested and gated,
+            // just not the default.
+            if opt_in_simd_dot()
+                && std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("fma")
+            {
+                // SAFETY: features detected above; the slices are indexed
+                // exactly as the scalar path does (base + k <= len is the
+                // caller's contract, shared by both paths).
+                return unsafe { self.dot_row_avx2(j, x, k) };
+            }
+        }
+        self.dot_row_scalar(j, x, k)
+    }
+
+    /// Scalar reference dot (also the non-x86 path).
+    #[inline]
+    pub fn dot_row_scalar(&self, j: usize, x: &[f32], k: usize) -> f32 {
         let base = j * k;
         match self {
             WeightMat::F32(v) => {
@@ -123,6 +147,82 @@ impl WeightMat {
         }
     }
 
+    /// AVX2+FMA dot: 8 f32 lane accumulators + horizontal reduce + scalar
+    /// tail. bf16 widens u16->u32->(<<16)->bitcast per 8-lane batch; int8
+    /// sign-extends and rescales per row. F16 stays scalar (its exponent
+    /// math doesn't widen cheaply; bf16/f32/int8 are the live paths).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn dot_row_avx2(&self, j: usize, x: &[f32], k: usize) -> f32 {
+        use std::arch::x86_64::*;
+        let base = j * k;
+        let xp = x.as_ptr();
+        let mut i = 0usize;
+        let mut acc = _mm256_setzero_ps();
+        match self {
+            WeightMat::F32(v) => {
+                let wp = v.as_ptr().add(base);
+                while i + 8 <= k {
+                    let wv = _mm256_loadu_ps(wp.add(i));
+                    let xv = _mm256_loadu_ps(xp.add(i));
+                    acc = _mm256_fmadd_ps(wv, xv, acc);
+                    i += 8;
+                }
+            }
+            WeightMat::BF16(v) => {
+                let wp = v.as_ptr().add(base);
+                while i + 8 <= k {
+                    // 8 x u16 -> 8 x u32 (zero-extend) -> f32 bits (<<16)
+                    let raw = _mm_loadu_si128(wp.add(i) as *const __m128i);
+                    let wide = _mm256_cvtepu16_epi32(raw);
+                    let bits = _mm256_slli_epi32(wide, 16);
+                    let wv = _mm256_castsi256_ps(bits);
+                    let xv = _mm256_loadu_ps(xp.add(i));
+                    acc = _mm256_fmadd_ps(wv, xv, acc);
+                    i += 8;
+                }
+            }
+            WeightMat::INT8 { q, scale } => {
+                let wp = q.as_ptr().add(base);
+                while i + 8 <= k {
+                    // 8 x i8 -> 8 x i32 (sign-extend) -> f32
+                    let raw = _mm_loadu_si128(wp.add(i) as *const __m128i);
+                    let wide = _mm256_cvtepi8_epi32(raw);
+                    let wv = _mm256_cvtepi32_ps(wide);
+                    let xv = _mm256_loadu_ps(xp.add(i));
+                    acc = _mm256_fmadd_ps(wv, xv, acc);
+                    i += 8;
+                }
+                let s = hsum256(acc);
+                let mut tail = s;
+                while i < k {
+                    tail += *wp.add(i) as f32 * *xp.add(i);
+                    i += 1;
+                }
+                return tail * scale[j];
+            }
+            WeightMat::F16(_) => return self.dot_row_scalar(j, x, k),
+        }
+        let s = hsum256(acc);
+        let mut tail = s;
+        match self {
+            WeightMat::F32(v) => {
+                while i < k {
+                    tail += *v.as_ptr().add(base + i) * *xp.add(i);
+                    i += 1;
+                }
+            }
+            WeightMat::BF16(v) => {
+                while i < k {
+                    tail += bf16_bits_to_f32(*v.as_ptr().add(base + i)) * *xp.add(i);
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        tail
+    }
+
     /// Storage dtype tag (diagnostics/tests).
     pub fn tag(&self) -> &'static str {
         match self {
@@ -141,6 +241,27 @@ impl WeightMat {
             WeightMat::INT8 { q, scale } => q.len() + 4 * scale.len(),
         }
     }
+}
+
+/// `INFERNO_SIMD=1` opts INTO the hand-written AVX2 dot (experiment only —
+/// scalar is the default and measured faster, docs/DOTFMA.md).
+fn opt_in_simd_dot() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("INFERNO_SIMD").is_some())
+}
+
+/// AVX2 horizontal sum of 8 f32 lanes (deterministic lane order:
+/// (0+4)+(1+5)+(2+6)+(3+7) pairwise). AVX2-only (no reduce_add intrinsic).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(acc: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let s4 = _mm_add_ps(lo, hi);
+    let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    let s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 0x55));
+    _mm_cvtss_f32(s1)
 }
 
 /// f32 → bf16 bits, round-to-nearest-even on the truncated mantissa.
