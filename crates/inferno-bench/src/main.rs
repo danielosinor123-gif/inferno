@@ -591,6 +591,82 @@ fn cmd_bench(admission: std::sync::Arc<dyn Admission>, sched_label: &str) {
     }
 }
 
+/// Real resident-set bytes from /proc/self/statm (Linux); None elsewhere —
+/// the registry's accounting is an ESTIMATE and this is its honest
+/// cross-check (docs/LIFECYCLE.md gate 4).
+fn rss_bytes() -> Option<usize> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: usize = s.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
+}
+
+fn cmd_models() {
+    use inferno_model::registry::ModelRegistry;
+    let a = args();
+    let dir = flag(&a, "--model-dir", "/root/models/qwen2.5-0.5b");
+    let budget_mb: usize = flag(&a, "--budget-mb", "1400").parse().unwrap_or(1400);
+    let mut reg = ModelRegistry::new(budget_mb * 1024 * 1024);
+    // KV geometry for the demo model (Qwen2.5-0.5B); the registry is
+    // file-agnostic — three names, one file, so the lifecycle mechanics
+    // (load/evict/reload) are what's being demonstrated, not vocabularies.
+    let kv = KvConfig {
+        block_size: 16,
+        num_blocks: 128,
+        num_layers: 24,
+        num_kv_heads: 2,
+        head_dim: 64,
+    };
+    for name in ["primary", "secondary", "router"] {
+        let d = dir.clone();
+        reg.register(name, kv.clone(), Box::new(move || QwenEngine::load(std::path::Path::new(&d))));
+    }
+    let rss = || -> String {
+        match rss_bytes() {
+            Some(b) => format!("{} MB", b / 1024 / 1024),
+            None => "n/a".into(),
+        }
+    };
+    let show = |step: &str, reg: &ModelRegistry| {
+        println!(
+            "  {step:<28} resident={} ({} MB) evictions={} rss={}",
+            reg.resident_names().join(","),
+            reg.resident_bytes() / 1024 / 1024,
+            reg.evictions(),
+            rss()
+        );
+    };
+    println!(
+        "models mode — budget {} MB, names {:?}",
+        budget_mb,
+        reg.known()
+    );
+    reg.get("primary").unwrap();
+    show("load primary (cold)", &reg);
+    reg.get("secondary").unwrap();
+    show("load secondary (evicts LRU)", &reg);
+    reg.get("primary").unwrap();
+    show("reprimary (reload #2)", &reg);
+    println!("    primary load_events={} (evict+reload is visible here)", reg.load_events("primary"));
+    // Pinned-model safety: an in-flight request must block eviction, loudly.
+    reg.begin_request("primary").unwrap();
+    let e = match reg.get("secondary") {
+        Err(e) => e,
+        Ok(_) => panic!("loading secondary must refuse while primary is in flight"),
+    };
+    println!("  in-flight refusal: {e}");
+    show("primary pinned, nothing evicted", &reg);
+    reg.end_request("primary");
+    reg.get("secondary").unwrap();
+    show("release pin, load secondary", &reg);
+    println!(
+        "  DONE — evictions={} load_events p/s/r = {}/{}/{}",
+        reg.evictions(),
+        reg.load_events("primary"),
+        reg.load_events("secondary"),
+        reg.load_events("router")
+    );
+}
+
 fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
     let a = args();
     let dir = flag(&a, "--model-dir", "/root/models/qwen2.5-0.5b");
@@ -760,6 +836,7 @@ fn main() {
         "overhead" => cmd_overhead(),
         "model" => cmd_model(admission),
         "bench" => cmd_bench(admission, label),
+        "models" => cmd_models(),
         "tok" => cmd_tok(),
         _ => {
             eprintln!("usage: inferno-bench [load|threads|model|bench|overhead] [options]");
@@ -767,6 +844,7 @@ fn main() {
             eprintln!("  threads: --threads N");
             eprintln!("  model: --model-dir PATH [--prompt TEXT] [--max-gen N] [--blocks N]");
             eprintln!("  bench: --prompt-len N --max-gen N --conc N --reps N [--stagger 1] --tag NAME --csv PATH");
+            eprintln!("  models: [--model-dir PATH] [--budget-mb N] registry lifecycle demo (load/evict/reload)");
             eprintln!("  tok: (no options) direct tokenizers-crate probe");
             std::process::exit(2);
         }

@@ -111,6 +111,108 @@ impl QwenEngine {
         })
     }
 
+    /// Resident weight bytes (registry budget accounting).
+    pub fn weight_bytes(&self) -> usize {
+        self.w.weight_bytes()
+    }
+
+    /// Fused multi-matrix gemv: one worker dispatch for several matrices
+    /// that share the SAME input vector (q/k/v on the attention norm;
+    /// gate/up on the MLP norm). Cuts per-token dispatches 7/layer to
+    /// 4/layer (169 -> 97 calls/token) without touching any dot —
+    /// bit-identical by construction (docs/WEIGHTS16.md next candidate).
+    /// `tasks[k]` is (matrix, rows); `outs[k]` receives its result; the
+    /// reassembly maps each returned value back by flat position, so chunk
+    /// boundaries never matter.
+    fn gemv_many(
+        &self,
+        tasks: &[(&WeightMat, usize)],
+        x: &[f32],
+        outs: &mut [&mut [f32]],
+    ) {
+        debug_assert_eq!(tasks.len(), outs.len());
+        let k = x.len();
+        let Some(pool) = self.pool.as_ref() else {
+            for (ti, (mat, rows)) in tasks.iter().enumerate() {
+                for j in 0..*rows {
+                    outs[ti][j] = mat.dot_row(j, x, k);
+                }
+            }
+            return;
+        };
+        // Flat (task, row) list in submission order; results return in the
+        // same order, so position i in the reassembly maps to flat[i].
+        let flat: Vec<(usize, usize)> = tasks
+            .iter()
+            .enumerate()
+            .flat_map(|(t, (_, rows))| (0..*rows).map(move |j| (t, j)))
+            .collect();
+        // 'static captures: clone the matrix handles (refcount bumps) + x.
+        let mats: Vec<WeightMat> = tasks
+            .iter()
+            .map(|(m, _)| match m {
+                WeightMat::F32(v) => WeightMat::F32(std::sync::Arc::clone(v)),
+                WeightMat::BF16(v) => WeightMat::BF16(std::sync::Arc::clone(v)),
+                WeightMat::F16(v) => WeightMat::F16(std::sync::Arc::clone(v)),
+            })
+            .collect();
+        let xc = x.to_vec();
+        // clone for the workers; the local copy drives result reassembly.
+        let flat_for_workers = flat.clone();
+        let parts: Vec<Vec<f32>> = pool.map_chunks(flat_for_workers, move |items, _id| {
+            items.iter().map(|&(t, j)| mats[t].dot_row(j, &xc, k)).collect()
+        });
+        let mut pos = 0usize;
+        for p in parts {
+            for (i_local, v) in p.iter().enumerate() {
+                let (t, j) = flat[pos + i_local];
+                outs[t][j] = *v;
+            }
+            pos += p.len();
+        }
+    }
+
+    /// Public wrapper over the one-token forward (tests, diagnostics; the
+    /// batcher is the real caller). Builds nothing — the caller owns the cache.
+    pub fn forward_token_pub(
+        &self,
+        tok: u32,
+        pos: usize,
+        cache: &KvCache,
+        seq_id: u64,
+        kv_out: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        self.forward_token(tok, pos, cache, seq_id, kv_out)
+    }
+
+    /// Public wrapper over final-norm + lm_head (tests, diagnostics).
+    pub fn logits_of_pub(&self, x: &[f32]) -> Vec<f32> {
+        self.logits_of(x)
+    }
+
+    /// One-shot logits digest for bit-identity fingerprints (registry
+    /// evict/reload gate): private geometry-matched cache, one forward,
+    /// FNV-1a over the logit bits. Deterministic by construction.
+    pub fn logits_digest_pub(&self, tok: u32, pos: usize) -> u64 {
+        let mut cache = KvCache::new(inferno_core::kv_cache::KvConfig {
+            block_size: 16,
+            num_blocks: 2,
+            num_layers: self.cfg.num_layers,
+            num_kv_heads: self.cfg.num_kv_heads,
+            head_dim: self.cfg.head_dim,
+        });
+        assert!(cache.reserve(1, 1, &[]).is_some(), "digest cache reserve");
+        let mut kv = Vec::new();
+        let x = self.forward_token(tok, pos, &cache, 1, &mut kv);
+        let lg = self.logits_of(&x);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for v in lg {
+            h ^= v.to_bits() as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     /// Workers in the gemv pool (0 = scalar path). Diagnostics.
     pub fn pool_workers(&self) -> usize {
         self.pool.as_ref().map(|p| p.workers()).unwrap_or(0)
@@ -218,9 +320,12 @@ impl QwenEngine {
         for li in 0..l {
             let w = &self.w.layers[li];
             rmsnorm(&x, &w.norm_in, self.cfg.rms_eps, &mut h1);
-            self.gemv_rows(&w.q, &h1, qd, &mut q);
-            self.gemv_rows(&w.k, &h1, kvd, &mut k);
-            self.gemv_rows(&w.v, &h1, kvd, &mut v);
+            // q/k/v share the attention-norm input — ONE dispatch.
+            self.gemv_many(
+                &[(&w.q, qd), (&w.k, kvd), (&w.v, kvd)],
+                &h1,
+                &mut [&mut q[..], &mut k[..], &mut v[..]],
+            );
             // Qwen2.5 QKV bias (tensors exist in the checkpoint — verified
             // against the safetensors header)
             for (qv, &b) in q.iter_mut().zip(w.qb.iter()) {
@@ -248,8 +353,12 @@ impl QwenEngine {
             }
 
             rmsnorm(&x, &w.norm_post, self.cfg.rms_eps, &mut h1);
-            self.gemv_rows(&w.gate, &h1, inter, &mut gate);
-            self.gemv_rows(&w.up, &h1, inter, &mut up);
+            // gate/up share the MLP-norm input — ONE dispatch.
+            self.gemv_many(
+                &[(&w.gate, inter), (&w.up, inter)],
+                &h1,
+                &mut [&mut gate[..], &mut up[..]],
+            );
             // SwiGLU: down(silu(gate) * up)
             for i in 0..inter {
                 let g = gate[i];
@@ -317,13 +426,15 @@ impl QwenEngine {
     }
 }
 
+/// Test-only builders shared by engine and registry tests (hermetic: no
+/// files, no disk — tiny in-memory models).
 #[cfg(test)]
-mod tests {
+pub(crate) mod testutil {
     use super::*;
     use crate::config::ModelCfg;
-    use crate::weights::{LayerWeights, WeightMat};
+    use crate::weights::{bf16_from_f32, LayerWeights};
 
-    fn tiny_cfg() -> ModelCfg {
+    pub fn tiny_cfg() -> ModelCfg {
         ModelCfg {
             num_layers: 2,
             num_q_heads: 2,
@@ -340,7 +451,7 @@ mod tests {
         }
     }
 
-    fn tiny_weights() -> QwenWeights {
+    pub fn tiny_weights() -> QwenWeights {
         let cfg = tiny_cfg();
         let f = |i: usize, j: usize| ((i * 31 + j * 17) % 11) as f32 * 0.04 - 0.2;
         let fill = |rows: usize, cols: usize, salt: usize| -> Vec<f32> {
@@ -349,25 +460,25 @@ mod tests {
         QwenWeights {
             // bf16 storage (the real checkpoint's dtype): the reference gate
             // now compares the PARALLEL BF16 engine vs a scalar BF16 reference.
-            embed: crate::weights::bf16_from_f32(fill(cfg.vocab, cfg.hidden, 0)),
+            embed: bf16_from_f32(fill(cfg.vocab, cfg.hidden, 0)),
             layers: (0..cfg.num_layers)
                 .map(|l| LayerWeights {
-                    q: crate::weights::bf16_from_f32(fill(
+                    q: bf16_from_f32(fill(
                         cfg.num_q_heads * cfg.head_dim,
                         cfg.hidden,
                         10 + l,
                     )),
-                    k: crate::weights::bf16_from_f32(fill(
+                    k: bf16_from_f32(fill(
                         cfg.num_kv_heads * cfg.head_dim,
                         cfg.hidden,
                         20 + l,
                     )),
-                    v: crate::weights::bf16_from_f32(fill(
+                    v: bf16_from_f32(fill(
                         cfg.num_kv_heads * cfg.head_dim,
                         cfg.hidden,
                         30 + l,
                     )),
-                    o: crate::weights::bf16_from_f32(fill(
+                    o: bf16_from_f32(fill(
                         cfg.hidden,
                         cfg.num_q_heads * cfg.head_dim,
                         40 + l,
@@ -387,9 +498,9 @@ mod tests {
                             .map(|i| f(i, 93 + l) * 0.05)
                             .collect(),
                     ),
-                    gate: crate::weights::bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 50 + l)),
-                    up: crate::weights::bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 60 + l)),
-                    down: crate::weights::bf16_from_f32(fill(cfg.hidden, cfg.intermediate, 70 + l)),
+                    gate: bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 50 + l)),
+                    up: bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 60 + l)),
+                    down: bf16_from_f32(fill(cfg.hidden, cfg.intermediate, 70 + l)),
                     norm_in: std::sync::Arc::new(
                         (0..cfg.hidden).map(|i| 1.0 + f(i, l) * 0.1).collect(),
                     ),
@@ -404,6 +515,13 @@ mod tests {
             tied_head: true,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::{tiny_cfg, tiny_weights};
+    use super::*;
+    use crate::weights::WeightMat;
 
     /// Independent reference forward (test-local, no engine code): dense
     /// history arrays, hand-rolled rmsnorm/rope/attention/silu. Any wiring

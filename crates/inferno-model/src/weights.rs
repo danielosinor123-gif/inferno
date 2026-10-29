@@ -91,6 +91,14 @@ impl WeightMat {
             WeightMat::F16(_) => "f16",
         }
     }
+
+    /// Resident bytes for this matrix (the registry's budget accounting).
+    pub fn bytes(&self) -> usize {
+        match self {
+            WeightMat::F32(v) => 4 * v.len(),
+            WeightMat::BF16(v) | WeightMat::F16(v) => 2 * v.len(),
+        }
+    }
 }
 
 /// f32 → bf16 bits, round-to-nearest-even on the truncated mantissa.
@@ -296,6 +304,25 @@ mod tests {
                 "bf16 rel error {rel} exceeds 2^-8 for {v}"
             );
         }
+    }
+}
+
+impl QwenWeights {
+    /// Resident bytes of all weights (matrices at their storage dtype,
+    /// norms/biases as f32) — the registry's budget accounting input.
+    pub fn weight_bytes(&self) -> usize {
+        let mut b = self.embed.bytes() + 4 * self.norm.len();
+        for l in &self.layers {
+            b += l.q.bytes()
+                + l.k.bytes()
+                + l.v.bytes()
+                + l.o.bytes()
+                + l.gate.bytes()
+                + l.up.bytes()
+                + l.down.bytes()
+                + 4 * (l.qb.len() + l.kb.len() + l.vb.len() + l.norm_in.len() + l.norm_post.len());
+        }
+        b
     }
 }
 

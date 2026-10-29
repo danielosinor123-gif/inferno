@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod registry;
 pub mod weights;
 
 pub use config::ModelCfg;

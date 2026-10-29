@@ -137,6 +137,12 @@ impl KvCache {
         cfg.num_layers * 2 * cfg.block_size * cfg.num_kv_heads * cfg.head_dim
     }
 
+    /// Resident bytes of a pool with this config (registry budget accounting;
+    /// no cache instance needed — the pool is a preallocated Vec<f32>).
+    pub fn pool_bytes(cfg: &KvConfig) -> usize {
+        Self::stride_of(cfg) * cfg.num_blocks * 4
+    }
+
     /// Tokens of a seq table's capacity (blocks * block_size).
     pub fn seq_capacity(&self, seq_id: u64) -> usize {
         self.seq_len_blocks(seq_id) * self.cfg.block_size

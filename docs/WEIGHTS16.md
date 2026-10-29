@@ -69,8 +69,34 @@ Claim tested → failed → fixed → re-measured, all recorded.
 is now a bit-copy for bf16 checkpoints). The WSL VM fragility that killed
 three benchmark legs is materially reduced.
 
-**What's left of the bottleneck**: TPOT 734ms is the sum of (a) remaining
-weight streaming (~1.0 GB/token at 4 workers on one bus) and (b) ~169 gemv
-dispatches per token. Next pre-registered candidates: fuse the per-layer
-gemv dispatches (7→1 per layer) and/or keep the tied lm_head in bf16 across
-tokens (already bf16 — the remaining stream is the 24 layers).
+## Dispatch fusion (W7) — the follow-up candidate, measured
+
+Fusing the per-layer gemv dispatches (`q/k/v` share the attention norm;
+`gate/up` share the MLP norm — one `map_chunks` each, 7→4 dispatches per
+layer, 169→97 per token) is implemented and gated bit-identical (37/37 tests,
+reference gate rerun). **Measured via back-to-back interleaved A/B in one VM
+session** (the only trustworthy comparison on this host — see note):
+
+| | W6bf16r (per-matrix dispatch) | W7fusedr (fused) |
+|---|---|---|
+| TTFT | 18.82 / 18.76 s | 16.68 / 17.90 s |
+| TPOT | 788.5 / 787.3 ms | 774.0 / 695.2 ms |
+
+Fusion: **TTFT −8%, TPOT −6.5%** — kept.
+
+**Methodology finding worth its own line**: the first W7fused measurement
+(944/1018 ms) looked WORSE than W6bf16b (733/740 ms), but those two rows came
+from different sessions with different host load — this host's run-to-run
+variance is ±30%. *Interleaved same-session A/B is the only comparison worth
+trusting here*; the session-ab-ac package above is the honest one. The
+bench harness's machine-state logging flags the variance; the fix for it is
+paired runs, not better averaging.
+
+**What's left of the bottleneck**: TPOT ~735 ms is now mostly the remaining
+weight stream (~1.0 GB/token, 4 workers on one DRAM bus — arithmetic says the
+bf16 halving already did what it can for a shared bus). Further gains need
+either a wider machine (the reference-hardware question) or a fundamentally
+different memory story (weight caching across tokens is already in place;
+the stream is the 24 layers + lm_head, read once per token by construction
+of dense gemv — int8 weights or sparse skipping are the next candidates,
+both to be pre-registered first).
