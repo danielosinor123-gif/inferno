@@ -667,6 +667,18 @@ fn cmd_models() {
     );
 }
 
+/// Parse --weights (bf16|int8). int8 quantizes once at load
+/// (docs/WEIGHTS8.md); bf16 is the exact default.
+fn storage_flag(a: &[String]) -> inferno_model::weights::Storage {
+    match flag(a, "--weights", "bf16").as_str() {
+        "int8" => inferno_model::weights::Storage::Int8,
+        other => {
+            assert_eq!(other, "bf16", "--weights must be bf16 or int8");
+            inferno_model::weights::Storage::Bf16
+        }
+    }
+}
+
 fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
     let a = args();
     let dir = flag(&a, "--model-dir", "/root/models/qwen2.5-0.5b");
@@ -675,7 +687,10 @@ fn cmd_model(admission: std::sync::Arc<dyn Admission>) {
     let blocks: usize = flag(&a, "--blocks", "512").parse().unwrap_or(512);
 
     println!("model mode — loading {dir} ...");
-    let mut engine = QwenEngine::load(std::path::Path::new(&dir)).expect("model load failed");
+    let storage = storage_flag(&a);
+    let mut engine =
+        QwenEngine::load_with_storage(std::path::Path::new(&dir), storage).expect("model load failed");
+    println!("  storage: {}", storage.tag());
     println!(
         "  model: {} layers | {} q / {} kv heads, head_dim {} | hidden {} | vocab {}",
         engine.cfg.num_layers,

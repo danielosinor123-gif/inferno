@@ -17,6 +17,13 @@ pub enum WeightMat {
     F32(Arc<Vec<f32>>),
     BF16(Arc<Vec<u16>>),
     F16(Arc<Vec<u16>>),
+    /// int8 with a per-row f32 scale (symmetric absmax). The dot stays
+    /// `scale * sum(q_i * x_i)` — same summation order, one extra multiply
+    /// per row (docs/WEIGHTS8.md).
+    INT8 {
+        q: Arc<Vec<i8>>,
+        scale: Arc<Vec<f32>>,
+    },
 }
 
 impl WeightMat {
@@ -25,6 +32,7 @@ impl WeightMat {
             WeightMat::F32(v) => v.len(),
             WeightMat::BF16(v) => v.len(),
             WeightMat::F16(v) => v.len(),
+            WeightMat::INT8 { q, .. } => q.len(),
         }
     }
 
@@ -37,13 +45,37 @@ impl WeightMat {
         self.elem_len() == 0
     }
 
-    /// f32 value of element `idx` (per-row conversion).
+    /// f32 value of element `idx` (per-row conversion). INT8 has no
+    /// element-wise accessor (a single element needs its row's scale) —
+    /// use `row_to_vec` for that storage.
     #[inline]
     pub fn at(&self, idx: usize) -> f32 {
         match self {
             WeightMat::F32(v) => v[idx],
             WeightMat::BF16(v) => bf16_bits_to_f32(v[idx]),
             WeightMat::F16(v) => f16_bits_to_f32(v[idx]),
+            WeightMat::INT8 { .. } => panic!("INT8 has no element accessor; use row_to_vec"),
+        }
+    }
+
+    /// Row j of a [rows, k] matrix as an f32 Vec — for element-wise reads
+    /// (embedding lookups, reference forwards).
+    pub fn row_to_vec(&self, j: usize, k: usize) -> Vec<f32> {
+        let base = j * k;
+        match self {
+            WeightMat::F32(v) => v[base..base + k].to_vec(),
+            WeightMat::BF16(v) => v[base..base + k]
+                .iter()
+                .map(|&b| bf16_bits_to_f32(b))
+                .collect(),
+            WeightMat::F16(v) => v[base..base + k]
+                .iter()
+                .map(|&b| f16_bits_to_f32(b))
+                .collect(),
+            WeightMat::INT8 { q, scale } => q[base..base + k]
+                .iter()
+                .map(|&v| v as f32 * scale[j])
+                .collect(),
         }
     }
 
@@ -80,6 +112,14 @@ impl WeightMat {
                 }
                 s
             }
+            WeightMat::INT8 { q, scale } => {
+                let row = &q[base..base + k];
+                let mut s = 0.0f32;
+                for i in 0..k {
+                    s += row[i] as f32 * x[i];
+                }
+                s * scale[j]
+            }
         }
     }
 
@@ -89,6 +129,7 @@ impl WeightMat {
             WeightMat::F32(_) => "f32",
             WeightMat::BF16(_) => "bf16",
             WeightMat::F16(_) => "f16",
+            WeightMat::INT8 { .. } => "int8",
         }
     }
 
@@ -97,6 +138,7 @@ impl WeightMat {
         match self {
             WeightMat::F32(v) => 4 * v.len(),
             WeightMat::BF16(v) | WeightMat::F16(v) => 2 * v.len(),
+            WeightMat::INT8 { q, scale } => q.len() + 4 * scale.len(),
         }
     }
 }
@@ -118,6 +160,34 @@ pub fn f32_to_bf16_bits(x: f32) -> u16 {
 pub fn bf16_from_f32(v: Vec<f32>) -> WeightMat {
     let u: Vec<u16> = v.iter().map(|&x| f32_to_bf16_bits(x)).collect();
     WeightMat::BF16(Arc::new(u))
+}
+
+/// Quantize a [rows, cols] f32 block to int8, per-row symmetric absmax
+/// scale (scale = absmax/127; zero rows get scale 1, all-zero codes).
+pub fn int8_from_block(v: &[f32], cols: usize) -> WeightMat {
+    assert!(cols > 0 && v.len() % cols == 0, "int8: ragged block");
+    let rows = v.len() / cols;
+    let mut q: Vec<i8> = Vec::with_capacity(v.len());
+    let mut scales: Vec<f32> = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let row = &v[r * cols..(r + 1) * cols];
+        let absmax = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        if absmax == 0.0 || !absmax.is_finite() {
+            scales.push(1.0);
+            q.extend(std::iter::repeat(0i8).take(cols));
+            continue;
+        }
+        let s = absmax / 127.0;
+        let inv = 1.0 / s;
+        scales.push(s);
+        for &x in row {
+            q.push((x * inv).round().clamp(-127.0, 127.0) as i8);
+        }
+    }
+    WeightMat::INT8 {
+        q: Arc::new(q),
+        scale: Arc::new(scales),
+    }
 }
 
 pub struct LayerWeights {
@@ -305,6 +375,60 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn int8_quantization_bounded_and_row_shaped() {
+        // [3, 4] block; per-row absmax scale => each row's max element maps
+        // exactly to ±127 (rel error ~0), others bounded by 1/127.
+        let block: Vec<f32> = vec![
+            0.05, -0.02, 0.01, 0.0, // row 0 (absmax 0.05)
+            -0.5, 0.25, 0.0, 0.1, // row 1 (absmax 0.5)
+            1.0, -1.0, 0.5, -0.5, // row 2 (absmax 1.0)
+        ];
+        let mat = int8_from_block(&block, 4);
+        match &mat {
+            WeightMat::INT8 { scale, .. } => {
+                assert_eq!(scale.len(), 3, "one scale per row");
+                for (r, &s) in scale.iter().enumerate() {
+                    let row = &block[r * 4..r * 4 + 4];
+                    let amax = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+                    assert!((s - amax / 127.0).abs() < 1e-9, "row {r} scale {s}");
+                }
+            }
+            other => panic!("expected INT8, got {}", other.tag()),
+        }
+        // dequantized values bounded: |q*s - x| <= s/2 per element
+        for r in 0..3 {
+            let row = mat.row_to_vec(r, 4);
+            for i in 0..4 {
+                let got = row[i];
+                let want = block[r * 4 + i];
+                let err = (got - want).abs();
+                let s = match &mat {
+                    WeightMat::INT8 { scale, .. } => scale[r],
+                    _ => unreachable!(),
+                };
+                assert!(err <= s / 2.0 + 1e-9, "row {r} elem {i}: err {err} > s/2");
+            }
+        }
+        // dot_row against a naive dequantized dot (order identical)
+        let x = [1.0f32, -2.0, 3.0, 0.5];
+        let want: f32 = block[4..8]
+            .iter()
+            .zip(x.iter())
+            .map(|(w, xi)| w * xi)
+            .sum();
+        let got = mat.dot_row(1, &x, 4);
+        // quantized: each element within s/2 of x -> total within k*s/2
+        let s = match &mat {
+            WeightMat::INT8 { scale, .. } => scale[1],
+            _ => unreachable!(),
+        };
+        assert!((got - want).abs() <= 4.0 * s / 2.0 + 1e-6, "dot {got} vs {want}");
+        // a zero row must not NaN: scale 1, all zeros
+        let z = int8_from_block(&[0.0, 0.0, 0.0, 0.0], 4);
+        assert_eq!(z.dot_row(0, &x, 4), 0.0);
+    }
 }
 
 impl QwenWeights {
@@ -326,11 +450,97 @@ impl QwenWeights {
     }
 }
 
+/// Storage dtype for the big matrices at load time (docs/WEIGHTS8.md).
+/// `Int8` quantizes bf16/f16/f32 checkpoints once at load; `Bf16` keeps the
+/// checkpoint's native dtype (exact).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Storage {
+    Bf16,
+    Int8,
+}
+
+impl Storage {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Storage::Bf16 => "bf16",
+            Storage::Int8 => "int8",
+        }
+    }
+}
+
+/// Read one tensor and quantize to int8 (per-row absmax). Row-streamed: the
+/// only transient is one row buffer (cols floats), so loading a 544 MB
+/// embedding never spikes.
+fn tensor_to_int8(st: &SafeTensors, name: &str, want: &[usize]) -> Result<WeightMat, String> {
+    let t = st
+        .tensor(name)
+        .map_err(|e| format!("missing tensor {name}: {e}"))?;
+    let sh = t.shape();
+    if sh != want {
+        return Err(format!("tensor {name}: shape {sh:?} != expected {want:?}"));
+    }
+    let n: usize = want.iter().product();
+    let cols = want.get(1).copied().filter(|c| *c > 0).unwrap_or(1);
+    let rows = n / cols;
+    let bytes = t.data();
+    let mut q: Vec<i8> = Vec::with_capacity(n);
+    let mut scales: Vec<f32> = Vec::with_capacity(rows);
+    let mut rowbuf: Vec<f32> = Vec::with_capacity(cols);
+    for r in 0..rows {
+        rowbuf.clear();
+        let base = r * cols;
+        match t.dtype() {
+            Dtype::BF16 => {
+                for c in bytes[base * 2..base * 2 + cols * 2].chunks_exact(2) {
+                    rowbuf.push(bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])));
+                }
+            }
+            Dtype::F16 => {
+                for c in bytes[base * 2..base * 2 + cols * 2].chunks_exact(2) {
+                    rowbuf.push(f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])));
+                }
+            }
+            Dtype::F32 => {
+                for c in bytes[base * 4..base * 4 + cols * 4].chunks_exact(4) {
+                    rowbuf.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "tensor {name}: unsupported dtype {other:?} (need bf16/fp16/fp32)"
+                ))
+            }
+        }
+        let absmax = rowbuf.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        if absmax == 0.0 || !absmax.is_finite() {
+            scales.push(1.0);
+            q.extend(std::iter::repeat(0i8).take(cols));
+            continue;
+        }
+        let s = absmax / 127.0;
+        let inv = 1.0 / s;
+        scales.push(s);
+        for &x in &rowbuf {
+            q.push((x * inv).round().clamp(-127.0, 127.0) as i8);
+        }
+    }
+    Ok(WeightMat::INT8 {
+        q: Arc::new(q),
+        scale: Arc::new(scales),
+    })
+}
+
 impl QwenWeights {
-    /// Load a Qwen2.5 model directory (config.json + model.safetensors).
-    /// Peak RAM: f32 weights + mapped fp16 file (~3x model size in fp16
-    /// terms); the mapping is dropped before returning.
+    /// Load a Qwen2.5 model directory (config.json + model.safetensors),
+    /// bf16-native storage (exact round-trip of the checkpoint).
     pub fn load(dir: &Path) -> Result<(ModelCfg, Self), String> {
+        Self::load_with_storage(dir, Storage::Bf16)
+    }
+
+    /// Load with the big matrices in the given storage dtype
+    /// (docs/WEIGHTS8.md: Int8 quarters the stream, loses weight precision —
+    /// gated by generation equivalence, not bit-identity).
+    pub fn load_with_storage(dir: &Path, storage: Storage) -> Result<(ModelCfg, Self), String> {
         let cfg_path = dir.join("config.json");
         let cfg_bytes =
             std::fs::read(&cfg_path).map_err(|e| format!("reading {cfg_path:?}: {e}"))?;
@@ -350,7 +560,10 @@ impl QwenWeights {
         let kvd = cfg.num_kv_heads * cfg.head_dim;
         let inter = cfg.intermediate;
 
-        let embed = tensor_to_mat(&st, "model.embed_tokens.weight", &[cfg.vocab, h])?;
+        let embed = match storage {
+            Storage::Bf16 => tensor_to_mat(&st, "model.embed_tokens.weight", &[cfg.vocab, h])?,
+            Storage::Int8 => tensor_to_int8(&st, "model.embed_tokens.weight", &[cfg.vocab, h])?,
+        };
         if embed.elem_len() != cfg.vocab * h {
             return Err(format!(
                 "embed size {} != vocab*hidden {}",
@@ -365,9 +578,11 @@ impl QwenWeights {
             // NOTE: closure borrows `st` (no move) — moving would consume the
             // deserialized index on the first iteration.
             // Big matrices: dtype-preserving storage (bf16 stays bf16 — half
-            // the bytes streamed per token, docs/WEIGHTS16.md).
-            let pmat = |n: &str, want: &[usize]| {
-                tensor_to_mat(&st, &format!("model.layers.{i}.{n}"), want)
+            // the bytes streamed per token, docs/WEIGHTS16.md) or int8
+            // (docs/WEIGHTS8.md — quartered stream, quantized once at load).
+            let pmat = |n: &str, want: &[usize]| match storage {
+                Storage::Bf16 => tensor_to_mat(&st, &format!("model.layers.{i}.{n}"), want),
+                Storage::Int8 => tensor_to_int8(&st, &format!("model.layers.{i}.{n}"), want),
             };
             // Small vectors: converted to f32 once at load (biases + norms
             // are read per layer per forward; exactness matters, size doesn't).

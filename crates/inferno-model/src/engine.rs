@@ -96,9 +96,17 @@ impl QwenEngine {
     }
 
     /// Full load from a model directory: config.json + model.safetensors +
-    /// tokenizer.json.
+    /// tokenizer.json. bf16-native storage (exact).
     pub fn load(dir: &std::path::Path) -> Result<Self, String> {
-        let (cfg, w) = QwenWeights::load(dir)?;
+        Self::load_with_storage(dir, crate::weights::Storage::Bf16)
+    }
+
+    /// Full load with an explicit matrix storage dtype (docs/WEIGHTS8.md).
+    pub fn load_with_storage(
+        dir: &std::path::Path,
+        storage: crate::weights::Storage,
+    ) -> Result<Self, String> {
+        let (cfg, w) = QwenWeights::load_with_storage(dir, storage)?;
         let tok_path = dir.join("tokenizer.json");
         let tok = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| format!("loading {tok_path:?}: {e}"))?;
@@ -154,6 +162,10 @@ impl QwenEngine {
                 WeightMat::F32(v) => WeightMat::F32(std::sync::Arc::clone(v)),
                 WeightMat::BF16(v) => WeightMat::BF16(std::sync::Arc::clone(v)),
                 WeightMat::F16(v) => WeightMat::F16(std::sync::Arc::clone(v)),
+                WeightMat::INT8 { q, scale } => WeightMat::INT8 {
+                    q: std::sync::Arc::clone(q),
+                    scale: std::sync::Arc::clone(scale),
+                },
             })
             .collect();
         let xc = x.to_vec();
@@ -240,6 +252,10 @@ impl QwenEngine {
             WeightMat::F32(v) => WeightMat::F32(std::sync::Arc::clone(v)),
             WeightMat::BF16(v) => WeightMat::BF16(std::sync::Arc::clone(v)),
             WeightMat::F16(v) => WeightMat::F16(std::sync::Arc::clone(v)),
+            WeightMat::INT8 { q, scale } => WeightMat::INT8 {
+                q: std::sync::Arc::clone(q),
+                scale: std::sync::Arc::clone(scale),
+            },
         };
         let xc = x.to_vec();
         let idx: Vec<usize> = (0..rows).collect();
@@ -306,7 +322,7 @@ impl QwenEngine {
         let inter = self.cfg.intermediate;
 
         let e = tok as usize;
-        let mut x: Vec<f32> = (0..h).map(|i| self.w.embed.at(e * h + i)).collect();
+        let mut x: Vec<f32> = self.w.embed.row_to_vec(e, h);
         let mut h1 = vec![0.0f32; h];
         let mut q = vec![0.0f32; qd];
         let mut k = vec![0.0f32; kvd];
@@ -452,37 +468,52 @@ pub(crate) mod testutil {
     }
 
     pub fn tiny_weights() -> QwenWeights {
+        tiny_weights_storage(false)
+    }
+
+    /// Same tiny model in INT8 storage (quantized once from the f32 fill) —
+    /// exercises the int8 path through the same reference gate
+    /// (docs/WEIGHTS8.md gate 1c).
+    pub fn tiny_weights_int8() -> QwenWeights {
+        tiny_weights_storage(true)
+    }
+
+    fn tiny_weights_storage(int8: bool) -> QwenWeights {
         let cfg = tiny_cfg();
         let f = |i: usize, j: usize| ((i * 31 + j * 17) % 11) as f32 * 0.04 - 0.2;
         let fill = |rows: usize, cols: usize, salt: usize| -> Vec<f32> {
             (0..rows * cols).map(|k| f(k + salt, salt * 7 + k / cols.max(1))).collect()
         };
+        // Matrices in the requested storage; norms/biases stay f32 (exact).
+        let m = |v: Vec<f32>, cols: usize| -> crate::weights::WeightMat {
+            if int8 {
+                crate::weights::int8_from_block(&v, cols)
+            } else {
+                bf16_from_f32(v)
+            }
+        };
         QwenWeights {
             // bf16 storage (the real checkpoint's dtype): the reference gate
             // now compares the PARALLEL BF16 engine vs a scalar BF16 reference.
-            embed: bf16_from_f32(fill(cfg.vocab, cfg.hidden, 0)),
+            embed: m(fill(cfg.vocab, cfg.hidden, 0), cfg.hidden),
             layers: (0..cfg.num_layers)
                 .map(|l| LayerWeights {
-                    q: bf16_from_f32(fill(
+                    q: m(
+                        fill(cfg.num_q_heads * cfg.head_dim, cfg.hidden, 10 + l),
+                        cfg.hidden,
+                    ),
+                    k: m(
+                        fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 20 + l),
+                        cfg.hidden,
+                    ),
+                    v: m(
+                        fill(cfg.num_kv_heads * cfg.head_dim, cfg.hidden, 30 + l),
+                        cfg.hidden,
+                    ),
+                    o: m(
+                        fill(cfg.hidden, cfg.num_q_heads * cfg.head_dim, 40 + l),
                         cfg.num_q_heads * cfg.head_dim,
-                        cfg.hidden,
-                        10 + l,
-                    )),
-                    k: bf16_from_f32(fill(
-                        cfg.num_kv_heads * cfg.head_dim,
-                        cfg.hidden,
-                        20 + l,
-                    )),
-                    v: bf16_from_f32(fill(
-                        cfg.num_kv_heads * cfg.head_dim,
-                        cfg.hidden,
-                        30 + l,
-                    )),
-                    o: bf16_from_f32(fill(
-                        cfg.hidden,
-                        cfg.num_q_heads * cfg.head_dim,
-                        40 + l,
-                    )),
+                    ),
                     qb: std::sync::Arc::new(
                         (0..cfg.num_q_heads * cfg.head_dim)
                             .map(|i| f(i, 91 + l) * 0.05)
@@ -498,9 +529,9 @@ pub(crate) mod testutil {
                             .map(|i| f(i, 93 + l) * 0.05)
                             .collect(),
                     ),
-                    gate: bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 50 + l)),
-                    up: bf16_from_f32(fill(cfg.intermediate, cfg.hidden, 60 + l)),
-                    down: bf16_from_f32(fill(cfg.hidden, cfg.intermediate, 70 + l)),
+                    gate: m(fill(cfg.intermediate, cfg.hidden, 50 + l), cfg.hidden),
+                    up: m(fill(cfg.intermediate, cfg.hidden, 60 + l), cfg.hidden),
+                    down: m(fill(cfg.hidden, cfg.intermediate, 70 + l), cfg.intermediate),
                     norm_in: std::sync::Arc::new(
                         (0..cfg.hidden).map(|i| 1.0 + f(i, l) * 0.1).collect(),
                     ),
@@ -519,7 +550,7 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{tiny_cfg, tiny_weights};
+    use super::testutil::{tiny_cfg, tiny_weights, tiny_weights_int8};
     use super::*;
     use crate::weights::WeightMat;
 
@@ -540,7 +571,7 @@ mod tests {
         let qd = qh * d;
         let kvd = kvh_n * d;
         let group = qh / kvh_n;
-        let mut x: Vec<f32> = (0..h).map(|i| w.embed.at(tok as usize * h + i)).collect();
+        let mut x: Vec<f32> = w.embed.row_to_vec(tok as usize, h);
         kv_out.clear();
         for li in 0..l {
             let lw = &w.layers[li];
@@ -638,17 +669,65 @@ mod tests {
         let rms: f32 = (x.iter().map(|v| v * v).sum::<f32>() / h as f32 + cfg.rms_eps).sqrt();
         let xn: Vec<f32> = x.iter().zip(w.norm.iter()).map(|(v, g)| v / rms * g).collect();
         (0..cfg.vocab)
-            .map(|j| {
-                (0..h)
-                    .map(|i| w.embed.at(j * h + i) * xn[i])
-                    .sum::<f32>()
-            })
+            .map(|j| w.embed.row_to_vec(j, h).iter().zip(&xn).map(|(a, b)| a * b).sum::<f32>())
             .collect()
     }
 
     fn approx(a: &[f32], b: &[f32], tol: f32) -> bool {
         a.len() == b.len()
             && a.iter().zip(b).all(|(x, y)| (x - y).abs() / (1.0 + y.abs()) < tol)
+    }
+
+    #[test]
+    fn engine_matches_independent_reference_int8() {
+        // Same gate, INT8 storage (docs/WEIGHTS8.md gate 1c): the reference
+        // forward reads the same quantized storage, so agreement still
+        // catches wiring/order bugs; accuracy of the quantization itself is
+        // bounded by the weights.rs int8 test + the real-model probe.
+        let cfg = tiny_cfg();
+        let w = tiny_weights_int8();
+        let cache_cfg = inferno_core::kv_cache::KvConfig {
+            block_size: 4,
+            num_blocks: 8,
+            num_layers: cfg.num_layers,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+        };
+        let mut cache = inferno_core::kv_cache::KvCache::new(cache_cfg);
+        cache.reserve(7, 6, &[]).unwrap();
+        let eng = QwenEngine::new(cfg.clone(), w);
+
+        let prompt: Vec<u32> = vec![3, 11, 5, 21, 8];
+        let mut ref_k: Vec<Vec<f32>> = vec![Vec::new(); cfg.num_layers];
+        let mut ref_v: Vec<Vec<f32>> = vec![Vec::new(); cfg.num_layers];
+        let mut kv = Vec::new();
+        for (p, &t) in prompt.iter().enumerate() {
+            eng.forward_token(t, p, &cache, 7, &mut kv);
+            cache.write_token(7, p, &kv).unwrap();
+            let mut rkv = Vec::new();
+            let _ = ref_forward(&cfg, &eng.w, t, p, &ref_k, &ref_v, &mut rkv);
+            for li in 0..cfg.num_layers {
+                let off = li * 2 * (cfg.num_kv_heads * cfg.head_dim);
+                ref_k[li].extend_from_slice(
+                    &rkv[off..off + cfg.num_kv_heads * cfg.head_dim],
+                );
+                ref_v[li].extend_from_slice(
+                    &rkv[off + cfg.num_kv_heads * cfg.head_dim
+                        ..off + 2 * cfg.num_kv_heads * cfg.head_dim],
+                );
+            }
+            assert!(
+                approx(&kv, &rkv, 1e-4),
+                "kv mismatch at pos {p} (int8)"
+            );
+        }
+        let mut kv2 = Vec::new();
+        let x_last = eng.forward_token(*prompt.last().unwrap(), prompt.len() - 1, &cache, 7, &mut kv2);
+        let got = eng.logits_of(&x_last);
+        let mut rkv2 = Vec::new();
+        let rx = ref_forward(&cfg, &eng.w, *prompt.last().unwrap(), prompt.len() - 1, &ref_k, &ref_v, &mut rkv2);
+        let want = ref_logits(&cfg, &eng.w, &rx);
+        assert!(approx(&got, &want, 1e-3), "logits mismatch (int8)");
     }
 
     #[test]
