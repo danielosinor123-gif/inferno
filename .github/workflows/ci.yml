@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Hermetic suites: the workspace tests ARE the conformance gates
+  # (engine-vs-reference, dtype round-trips, bridge conformance, HTTP,
+  # registry, decision scoring) plus the Go plane. Live model gates
+  # (docs/BENCHMARK.md, the /v1/systemone live run) need the 1 GB weights
+  # and a running engine — not CI-shaped, they stay local by design.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: rustup component add clippy || true
+      - name: cargo test (workspace)
+        run: cargo test --workspace --release
+      # Clippy informational for now: the codebase carries a small lint
+      # backlog (style-only: enumerate-vs-index, chunks_exact constants).
+      # Flip this to `-D warnings` once the backlog is cleared — tracked in
+      # docs/GAPS.md.
+      - name: clippy (informational)
+        run: cargo clippy --workspace --all-targets || true
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: go build + vet + test
+        working-directory: plane
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...

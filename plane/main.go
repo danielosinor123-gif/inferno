@@ -58,6 +58,7 @@ func (p *Plane) routes() *http.ServeMux {
 	mux.HandleFunc("POST /v1/models/{name}/load", p.loadModel)
 	mux.HandleFunc("POST /v1/chat/completions", p.chatCompletions)
 	mux.HandleFunc("POST /v1/systemone", p.systemOne)
+	mux.HandleFunc("POST /v1/messages", p.anthropicMessages)
 	return mux
 }
 
@@ -215,6 +216,40 @@ func (p *Plane) systemOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := p.engine.send(http.MethodPost, "/v1/systemone", bytes.NewReader(body), "application/json")
+	if err != nil {
+		engineUnreachable(w, p.engine, err)
+		return
+	}
+	defer resp.Body.Close()
+	copyResponse(w, resp, false)
+}
+
+// anthropicMessages validates the Anthropic Messages API shape (model +
+// non-empty messages), then proxies. Claude Code and the Anthropic SDKs are
+// the target clients (docs/GAPS.md G23).
+func (p *Plane) anthropicMessages(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "unreadable body")
+		return
+	}
+	var req struct {
+		Model    string            `json:"model"`
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "body is not valid JSON: "+err.Error())
+		return
+	}
+	if req.Model == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "field 'model' is required")
+		return
+	}
+	if len(req.Messages) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "field 'messages' is required and non-empty")
+		return
+	}
+	resp, err := p.engine.send(http.MethodPost, "/v1/messages", bytes.NewReader(body), "application/json")
 	if err != nil {
 		engineUnreachable(w, p.engine, err)
 		return

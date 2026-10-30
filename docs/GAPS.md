@@ -103,9 +103,7 @@ the RAM/disk tables, download with resume, dashboard; AI-assistant setup doc
 and an MCP server are ecosystem plays for the fleet layer. *M. Includes G5.*
 
 **G23. Anthropic-compatible surface** - Claude Code and the Anthropic SDKs are
-the highest-value client population for a local endpoint. *S.*
-
-## Known debts (small, in-repo now)
+the highest-value client population for a local endpoint. *S.*## Known debts (small, in-repo now)
 - Real two-different-dirs multi-model test (same-weights covered the routing).
 - `out.prefill_tokens` metric never incremented (reporting only).
 - Mid-decode stash staleness panic on preemption (v1 loud failure; queued

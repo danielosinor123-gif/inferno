@@ -179,6 +179,51 @@ func TestSystemOneValidationAndProxy(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesValidationAndProxy(t *testing.T) {
+	p := testPlane(t, deadPortURL)
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"missing model", `{"messages":[{"role":"user","content":"hi"}]}`, http.StatusBadRequest},
+		{"empty messages", `{"model":"m","messages":[]}`, http.StatusBadRequest},
+		{"bad json", `{`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(tc.body))
+			p.routes().ServeHTTP(rr, req)
+			if rr.Code != tc.want {
+				t.Fatalf("code = %d, want %d (body %q)", rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+
+	// valid shape + live stub: Anthropic-shaped payload proxied verbatim
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("stub path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":" Paris"}],"stop_reason":"end_turn"}`))
+	}))
+	defer stub.Close()
+	pp := testPlane(t, stub.URL)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"chat","max_tokens":8,"messages":[{"role":"user","content":"The capital of France is"}]}`))
+	pp.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("messages = %d (body %q)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"stop_reason":"end_turn"`) {
+		t.Fatalf("body = %q, want the engine's Anthropic payload", rr.Body.String())
+	}
+}
+
 func TestLoadModelNameRequired(t *testing.T) {
 	p := testPlane(t, deadPortURL)
 	// The route pattern requires a name; an empty path can't match it, so

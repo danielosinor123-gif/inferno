@@ -71,6 +71,7 @@ impl ServeState {
             }
             ("POST", "/v1/chat/completions") => self.chat_completions(req),
             ("POST", "/v1/systemone") => self.system_one(req),
+            ("POST", "/v1/messages") => self.anthropic_messages(req),
             _ => Response::json(
                 404,
                 &serde_json::json!({"error": {"type": "not_found",
@@ -511,6 +512,125 @@ impl ServeState {
         )
     }
 
+    /// Tokenize text with the resident model (typed error if it has no
+    /// tokenizer — real loaders always carry one).
+    fn text_to_tokens(&mut self, model: &str, text: &str) -> Result<Vec<u32>, String> {
+        match self.reg.get_mut(model) {
+            Ok(engine) if engine.has_tokenizer() => Ok(engine.encode_text(text)),
+            Ok(_) => Err(format!("model {model:?} has no tokenizer; text scoring requires one")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// POST /v1/messages — the Anthropic Messages API shape, so Claude Code
+    /// and the Anthropic SDKs can point at a local engine. Non-streaming in
+    /// this slice (Anthropic's SSE event protocol is the next step).
+    fn anthropic_messages(&mut self, req: &Request) -> Response {
+        let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return bad_request(&format!("body is not valid JSON: {e}")),
+        };
+        let Some(model) = body.get("model").and_then(|v| v.as_str()) else {
+            return bad_request("field 'model' is required");
+        };
+        let Some(messages) = body.get("messages").and_then(|v| v.as_array()) else {
+            return bad_request("field 'messages' is required");
+        };
+        if messages.is_empty() {
+            return bad_request("field 'messages' must be non-empty");
+        }
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+        // system prepended; messages joined as "role: content"
+        let mut text = String::new();
+        if let Some(sys) = body.get("system").and_then(|v| v.as_str()) {
+            text.push_str(sys);
+            text.push('\n');
+        }
+        for (i, m) in messages.iter().enumerate() {
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = match m.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Array(parts)) => {
+                    // Anthropic content blocks: concatenate the text parts
+                    let mut acc = String::new();
+                    for p in parts {
+                        if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                            acc.push_str(t);
+                        }
+                    }
+                    acc
+                }
+                _ => {
+                    return bad_request(&format!(
+                        "message {i}: 'content' must be a string or an array of text blocks"
+                    ))
+                }
+            };
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("{role}: {content}"));
+        }
+
+        if let Err(e) = self.reg.begin_request(model) {
+            return match e {
+                inferno_model::registry::RegistryError::UnknownModel(_) => Response::json(
+                    404,
+                    &serde_json::json!({"error": {"type": "model_not_found",
+                        "message": format!("unknown model {model:?}")}}),
+                ),
+                other => Response::json(
+                    503,
+                    &serde_json::json!({"error": {"type": "model_unavailable",
+                        "message": other.to_string()}}),
+                ),
+            };
+        }
+        let tokens = match self.text_to_tokens(model, &text) {
+            Ok(t) => t,
+            Err(msg) => {
+                self.reg.end_request(model);
+                return bad_request(&msg);
+            }
+        };
+        if let Err(e) = self.ensure_batcher(model) {
+            self.reg.end_request(model);
+            return Response::json(
+                503,
+                &serde_json::json!({"error": {"type": "model_unavailable", "message": e}}),
+            );
+        }
+        let result = self.generate(model, tokens.clone(), max_tokens);
+        self.reg.end_request(model);
+        match result {
+            Ok(gen) => {
+                let content = gen.text.unwrap_or_default();
+                let id = format!("msg_{}", self.next_id);
+                self.next_id += 1;
+                Response::json(
+                    200,
+                    &serde_json::json!({
+                        "id": id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": content}],
+                        "model": model,
+                        "stop_reason": if gen.hit_max { "max_tokens" } else { "end_turn" },
+                        "usage": {
+                            "input_tokens": gen.prompt_tokens,
+                            "output_tokens": gen.tokens.len(),
+                        },
+                    }),
+                )
+            }
+            Err(msg) => bad_request(&msg),
+        }
+    }
+
     fn chat_completions(&mut self, req: &Request) -> Response {
         let body: serde_json::Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
@@ -844,6 +964,33 @@ mod tests {
         // TYPED 400 (gate 4: never a panic at the boundary)
         let (code, v) = post(r#"{"state":"x","questions":{"q":{"type":"noul"}}}"#);
         assert_eq!(code, 400, "tokenizer-less engine -> typed 400 ({v})");
+    }
+
+    #[test]
+    fn anthropic_messages_validation_is_typed() {
+        let post = |b: &str| {
+            let mut s = tiny_state();
+            let r = s.handle(&Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                query: vec![],
+                headers: vec![],
+                body: b.as_bytes().to_vec(),
+            });
+            (r.status, serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+        };
+        // missing model
+        let (code, _) = post(r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(code, 400, "missing model -> 400");
+        // empty messages
+        let (code, _) = post(r#"{"model":"tiny","messages":[]}"#);
+        assert_eq!(code, 400, "empty messages -> 400");
+        // bad content type
+        let (code, _) = post(r#"{"model":"tiny","messages":[{"role":"user","content":42}]}"#);
+        assert_eq!(code, 400, "non-string/array content -> 400");
+        // valid shape, tokenizer-less hermetic engine -> TYPED 400 (not a panic)
+        let (code, v) = post(r#"{"model":"tiny","messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(code, 400, "tokenizer-less engine -> 400 ({v})");
     }
 
     #[test]
