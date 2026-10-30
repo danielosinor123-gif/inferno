@@ -79,8 +79,33 @@ teams. *L.*
 **G17. OEM certification tooling.** Reference-BOM validation harness that
 prebuilts can run to earn "runs inferno" marks. *M.*
 
-## Known debts (small, in-repo now)
+## Tier 1.5 - adopted from the colibri study (docs/STUDY-colibri.md)
 
+**G18. MoE expert streaming.** The useful local model is a 35B-A3B class MoE
+(23 GB download, 10-20 GB resident, 6-10 tok/s on consumer silicon per
+colibri's published numbers) - not our 0.5B dense. Stream routed experts from
+NVMe through a per-layer LRU + session-learned pins. Their invariant becomes
+our gate: *placement decides speed, never which weights or router decisions
+fire* (verified by identical outputs across tiers). *L. Blocked by G1.*
+
+**G19. Placement tiers** - NVMe/RAM/VRAM residency with byte accounting per
+model (extends the ModelRegistry). *M. Blocked by G18.*
+
+**G20. Decision API** (`/v1/systemone`-style: score a state against allowed
+answers, return probabilities + confidence, generate nothing). Native fit for
+our greedy engine - the logits ARE the distribution. *S/M.*
+
+**G21. CI reference checks** - every engine verified against its model's
+reference implementation in CI (colibri does this; we do it by hand today). *S.*
+
+**G22. One-step consumer setup** - hardware detect, model recommendation from
+the RAM/disk tables, download with resume, dashboard; AI-assistant setup doc
+and an MCP server are ecosystem plays for the fleet layer. *M. Includes G5.*
+
+**G23. Anthropic-compatible surface** - Claude Code and the Anthropic SDKs are
+the highest-value client population for a local endpoint. *S.*
+
+## Known debts (small, in-repo now)
 - Real two-different-dirs multi-model test (same-weights covered the routing).
 - `out.prefill_tokens` metric never incremented (reporting only).
 - Mid-decode stash staleness panic on preemption (v1 loud failure; queued
