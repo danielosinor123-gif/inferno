@@ -1,0 +1,14 @@
+[package]
+name = "inferno-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ggml compute bridge for inferno (G1 — borrowed kernels, our architecture, docs/G1-GPU.md)"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+
+[features]
+default = []

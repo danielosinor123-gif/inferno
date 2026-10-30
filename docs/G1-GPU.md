@@ -1,4 +1,4 @@
-﻿# G1: GPU compute â€” pre-registered before implementation
+﻿# G1: GPU compute - pre-registered before implementation
 
 ## The decision (and why the obvious answer was rejected)
 
@@ -10,7 +10,7 @@ architectures were considered:
   kernels AND quantization, but forfeits our scheduling contract or forces a
   fork-maintenance treadmill.
 - **(a) wrap llama.cpp as the engine**: fastest, but it replaces our
-  *paged-KV engine* â€” the layer that carries the 28x prefix-retention win,
+  *paged-KV engine* - the layer that carries the 28x prefix-retention win,
   per-model batchers, and the Engine-trait gates. Borrowing it wholesale
   surrenders the moat.
 
@@ -18,10 +18,10 @@ architectures were considered:
 compute backend (ggml) behind our EXISTING `Engine` trait:
 
 ```
-batcher  â”€â”€â–º  inferno Engine trait (unchanged)  â”€â”€â–º  ggml backend (new)
-registry â”€â”€â–º    prefill_chunk / decode_kv / decode_step       â–²
-fore     â”€â”€â–º    our paged KV, our CoW, our retention          â”‚
-sight           our reference test still the scalar gate  â”€â”€â”€â”˜
+batcher   -->  inferno Engine trait (unchanged)  -->  ggml backend (new)
+registry  -->    prefill_chunk / decode_kv / decode_step      ^
+foresight -->    our paged KV, our CoW, our retention         |
+               our reference test still the scalar gate -----+
 ```
 
 The expensive part (hand-tuned GPU kernels, multiple vendor backends,
@@ -33,14 +33,14 @@ ADR-001: the moat lives in the layer we own.
 
 1. **Correctness / conformance**: the GPU engine and the CPU engine produce
    IDENTICAL greedy token streams on the probe set ("The capital of France
-   is" -> " Paris" family; the cafes prompt). Not approximate â€” identical
+   is" -> " Paris" family; the cafes prompt). Not approximate - identical
    ids, same as every earlier gate. The scalar CPU engine remains the
    reference; the GPU path must match it exactly.
 2. **No regression**: all 51 existing tests + the live HTTP gates stay green
    with the GPU engine untangled (feature-gated so the CPU path is the
    default build).
 3. **Speed, honest, paired**: same-session A/B (CPU vs GPU engine) on the
-   standard workload â€” TTFT + TPOT, with machine state. Expected GPU win is
+   standard workload - TTFT + TPOT, with machine state. Expected GPU win is
    large (10-100x on TPOT); if it is not, that is the finding.
 4. **VRAM accounting honest**: ggml buffer sizes + model + KV pool reported
    per model; cross-checked against nvidia-smi (the VM has an idle MX130 to
@@ -62,8 +62,26 @@ ADR-001: the moat lives in the layer we own.
 
 - [x] Decision recorded (d)
 - [x] Pre-registered written
-- [ ] Build ggml into the workspace (static, vendored â€” the network lesson)
-- [ ] Engine impl over ggml + gates 1,2,5 (hermetic first: tiny model, CPU
-      reference comparison)
+- [x] **ggml vendored and building**: pinned v0.8.0
+      (8642541b255bfb5dc39cd351a178be09013a55d6, MIT, third_party/VENDORED.md),
+      static-built by `crates/inferno-gpu/build.rs` (glob file selection,
+      gnu11, _GNU_SOURCE, no llamafile - a later option -, stdc++ linked).
+      The build fights worth recording: CMake-generated ggml-version.h (now
+      generated in build.rs), strict-c11 hiding POSIX declarations,
+      SCHED_BATCH needing _GNU_SOURCE, the unconditional tiled-matmul
+      dependency (ggml-cpu/tiled/), and C++ symbols needing the C++ runtime
+      at link time.
+- [x] **Bridge gate 0 (op-level) PASSES**: ggml mul_mat matches the scalar
+      gemv within the reference tolerance (crates/inferno-gpu/src/lib.rs test).
+- [ ] Engine-level hermetic conformance (full forward through ggml ops vs
+      the scalar reference - the next step)
 - [ ] Real-model conformance (gate 1)
 - [ ] Paired A/B + VRAM accounting (gates 3,4)
+- [ ] No-regression + typed failures (gates 2,5; CPU stays default)
+
+## Naming note
+
+The bridge currently runs ggml's CPU backend (the VM has no CUDA toolkit -
+`nvcc` absent, MX130 idle). The CUDA path is a documented follow-on; the
+CPU-backend bridge is the proof that the borrowed-kernel architecture
+works before any GPU toolchain enters the picture.
