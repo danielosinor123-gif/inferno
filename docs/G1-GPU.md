@@ -74,6 +74,12 @@ ADR-001: the moat lives in the layer we own.
 - [x] **Bridge gates: FOUR ops match the scalar kernels** (rms_norm, rope
       NEOX vs `kernels::rope`, swiglu/silu-mul, mul_mat) — all within the
       reference tolerance, tests in crates/inferno-gpu/src/lib.rs.
+- [x] **Engine-level hermetic conformance PASSES**: the full hybrid forward
+      (ggml for dense ops + OUR paged self-extension attention + biases)
+      matches the scalar QwenEngine on the tiny model over a 5-token
+      prefill — identical greedy argmax, logits within 1e-3 relative
+      (crates/inferno-gpu/src/engine.rs). The borrowed-kernel architecture
+      carries the whole forward.
 - **SIGSEGV caught by the gates, worth the record**: my first ggml_rope_ext
   call used an 11-arg ABI (scalar position) — the pinned header takes 13
   args with b = an i32 positions TENSOR. Lesson: FFI signatures get verified
@@ -81,10 +87,27 @@ ADR-001: the moat lives in the layer we own.
   ggml_rope would have been wrong anyway: it hardcodes freq_base=10000
   (Qwen2.5 needs theta=1e6), so the ext form with our theta is correct.
 - [ ] Engine-level hermetic conformance (full forward through ggml ops vs
-      the scalar reference - the next step)
+      the scalar reference - the next step) — DONE, see status above
+- [ ] **Real-model conformance (gate 1)** — blocked on the persistent-weights
+      design, pre-registered as the NEXT step: this slice stages each
+      WeightMat into a fresh ggml tensor per op (fine for the tiny model;
+      for the real model that re-copies ~1 GB/token and would make the
+      GPU path SLOWER than the CPU engine). Next step: weights loaded once
+      into ggml backend buffers (ggml-backend alloc + gallocr), graphs
+      built per token over resident tensors. That is the design where
+      borrowed kernels actually pay.
 - [ ] Real-model conformance (gate 1)
 - [ ] Paired A/B + VRAM accounting (gates 3,4)
 - [ ] No-regression + typed failures (gates 2,5; CPU stays default)
+
+## Per-op ownership (decided after the op-level gates)
+
+Bridged to ggml (commodity dense math): **mul_mat/gemv, rms_norm, rope
+(NEOX), silu-mul**. Kept ours (the moat): **attention** (paged, self-
+extension, prefix retention — ggml's dense/flash attention would forfeit
+exactly the layer this project exists for), plus the batcher, registry, and
+all gates. This is decision (d) applied op by op: borrow the kernels that
+are standard, keep the algorithm that differentiates.
 
 ## Naming note
 

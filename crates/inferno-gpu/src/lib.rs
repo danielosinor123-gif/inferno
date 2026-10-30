@@ -11,6 +11,8 @@
 
 use std::os::raw::c_void;
 
+pub mod engine;
+
 // ---- FFI (classic ggml API; stable across the pinned range) ----
 
 #[allow(non_camel_case_types)]

@@ -6,9 +6,8 @@ license.workspace = true
 description = "ggml compute bridge for inferno (G1 — borrowed kernels, our architecture, docs/G1-GPU.md)"
 
 [dependencies]
-
-[dev-dependencies]
 inferno-core = { path = "../inferno-core" }
+inferno-model = { path = "../inferno-model" }
 
 [build-dependencies]
 cc = "1"
