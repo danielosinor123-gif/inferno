@@ -70,6 +70,7 @@ impl ServeState {
                 self.load_model(name)
             }
             ("POST", "/v1/chat/completions") => self.chat_completions(req),
+            ("POST", "/v1/systemone") => self.system_one(req),
             _ => Response::json(
                 404,
                 &serde_json::json!({"error": {"type": "not_found",
@@ -353,6 +354,161 @@ impl ServeState {
         self.reg.end_request(model);
         let _ = count;
         Ok(())
+    }
+
+    /// POST /v1/systemone — decisions with probabilities (docs/DECISION-API.md).
+    fn system_one(&mut self, req: &Request) -> Response {
+        let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return bad_request(&format!("body is not valid JSON: {e}")),
+        };
+        let Some(state) = body.get("state").and_then(|v| v.as_str()) else {
+            return bad_request("field 'state' (string) is required");
+        };
+        if state.trim().is_empty() {
+            return bad_request("field 'state' must be non-empty");
+        }
+        let Some(questions) = body.get("questions").and_then(|v| v.as_object()) else {
+            return bad_request("field 'questions' (object) is required and non-empty");
+        };
+        if questions.is_empty() {
+            return bad_request("field 'questions' must be non-empty");
+        }
+        let model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                self.reg
+                    .known()
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+            });
+        if model.is_empty() {
+            return bad_request("no model registered");
+        }
+        let instructions = body
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if let Err(e) = self.reg.begin_request(&model) {
+            return match e {
+                inferno_model::registry::RegistryError::UnknownModel(_) => Response::json(
+                    404,
+                    &serde_json::json!({"error": {"type": "model_not_found",
+                        "message": format!("unknown model {model:?}")}}),
+                ),
+                other => Response::json(
+                    503,
+                    &serde_json::json!({"error": {"type": "model_unavailable",
+                        "message": other.to_string()}}),
+                ),
+            };
+        }
+        // Decisions are text-scored: the model must be able to tokenize.
+        // A tokenizer-less engine (hermetic/demo builds only — real loaders
+        // always carry one) is a typed refusal, never a panic.
+        let has_tok = self
+            .reg
+            .get(&model)
+            .map(|e| e.has_tokenizer())
+            .unwrap_or(false);
+        if !has_tok {
+            self.reg.end_request(&model);
+            return bad_request(&format!(
+                "model {model:?} has no tokenizer; decisions require text scoring"
+            ));
+        }
+        let mut results = serde_json::Map::new();
+        let mut failure: Option<String> = None;
+        for (name, spec) in questions {
+            let qtype = spec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let qinstr = spec
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .unwrap_or(instructions);
+            let cands = match qtype {
+                "choice" => {
+                    let Some(crit) = spec.get("criteria").and_then(|v| v.as_object()) else {
+                        failure = Some(format!(
+                            "question {name:?}: type 'choice' needs a non-empty 'criteria' object"
+                        ));
+                        break;
+                    };
+                    if crit.is_empty() {
+                        failure = Some(format!("question {name:?}: 'criteria' is empty"));
+                        break;
+                    }
+                    crit.keys().map(|l| (l.clone(), l.clone())).collect::<Vec<_>>()
+                }
+                "noul" => vec![("yes".to_string(), "yes".to_string()), ("no".to_string(), "no".to_string())],
+                other => {
+                    failure = Some(format!(
+                        "question {name:?}: unknown type {other:?} (supported: choice, noul)"
+                    ));
+                    break;
+                }
+            };
+            let res = match self.reg.get_mut(&model) {
+                Ok(engine) => crate::decision::decide(engine, state, qinstr, &cands),
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            };
+            match res {
+                Ok(d) => {
+                    let probs: serde_json::Map<String, serde_json::Value> = d
+                        .probabilities
+                        .iter()
+                        .map(|(l, p)| (l.clone(), serde_json::json!(p)))
+                        .collect();
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("type".into(), serde_json::json!(qtype));
+                    obj.insert("probabilities".into(), serde_json::Value::Object(probs));
+                    obj.insert("confidence".into(), serde_json::json!(d.confidence));
+                    if qtype == "choice" {
+                        let best = d
+                            .probabilities
+                            .iter()
+                            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                            .map(|(l, _)| l.clone())
+                            .unwrap_or_default();
+                        obj.insert("choice".into(), serde_json::json!(best));
+                    } else {
+                        let p_yes = d
+                            .probabilities
+                            .iter()
+                            .find(|(l, _)| l == "yes")
+                            .map(|(_, p)| *p)
+                            .unwrap_or(0.0);
+                        obj.insert("probability".into(), serde_json::json!(p_yes));
+                    }
+                    results.insert(name.clone(), serde_json::Value::Object(obj));
+                }
+                Err(e) => {
+                    failure = Some(format!("question {name:?}: {e}"));
+                    break;
+                }
+            }
+        }
+        self.reg.end_request(&model);
+        if let Some(msg) = failure {
+            return bad_request(&msg);
+        }
+        let n = self.next_id;
+        self.next_id += 1;
+        Response::json(
+            200,
+            &serde_json::json!({
+                "id": format!("sysone-{n}"),
+                "object": "systemone",
+                "model": model,
+                "results": serde_json::Value::Object(results),
+            }),
+        )
     }
 
     fn chat_completions(&mut self, req: &Request) -> Response {
@@ -655,6 +811,39 @@ mod tests {
         assert_eq!(r.status, 404);
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(v["error"]["type"], "model_not_found");
+    }
+
+    #[test]
+    fn systemone_validation_is_typed() {
+        let mut s = tiny_state();
+        let post = |b: &str| {
+            let mut s = tiny_state();
+            let r = s.handle(&Request {
+                method: "POST".into(),
+                path: "/v1/systemone".into(),
+                query: vec![],
+                headers: vec![],
+                body: b.as_bytes().to_vec(),
+            });
+            (r.status, serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+        };
+        let _ = &mut s;
+        // missing state
+        let (code, v) = post(r#"{"questions":{"q":{"type":"choice","criteria":{"a":null}}}}"#);
+        assert_eq!(code, 400, "missing state -> 400 ({v})");
+        // empty questions
+        let (code, v) = post(r#"{"state":"x","questions":{}}"#);
+        assert_eq!(code, 400, "empty questions -> 400 ({v})");
+        // choice without criteria
+        let (code, v) = post(r#"{"state":"x","questions":{"q":{"type":"choice"}}}"#);
+        assert_eq!(code, 400, "choice without criteria -> 400 ({v})");
+        // unknown type
+        let (code, v) = post(r#"{"state":"x","questions":{"q":{"type":"vibes"}}}"#);
+        assert_eq!(code, 400, "unknown type -> 400 ({v})");
+        // valid shape, but the hermetic tiny engine has no tokenizer ->
+        // TYPED 400 (gate 4: never a panic at the boundary)
+        let (code, v) = post(r#"{"state":"x","questions":{"q":{"type":"noul"}}}"#);
+        assert_eq!(code, 400, "tokenizer-less engine -> typed 400 ({v})");
     }
 
     #[test]

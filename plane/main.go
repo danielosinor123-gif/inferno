@@ -57,6 +57,7 @@ func (p *Plane) routes() *http.ServeMux {
 	mux.HandleFunc("GET /v1/models", p.proxyModels)
 	mux.HandleFunc("POST /v1/models/{name}/load", p.loadModel)
 	mux.HandleFunc("POST /v1/chat/completions", p.chatCompletions)
+	mux.HandleFunc("POST /v1/systemone", p.systemOne)
 	return mux
 }
 
@@ -183,6 +184,43 @@ func copyResponse(w http.ResponseWriter, resp *http.Response, flushPerWrite bool
 			return
 		}
 	}
+}
+
+// systemOneRequest is the decision API's shape (docs/DECISION-API.md).
+type systemOneRequest struct {
+	State     string            `json:"state"`
+	Questions map[string]json.RawMessage `json:"questions"`
+}
+
+// systemOne validates the decision shape (state + questions), then proxies.
+// The engine does the typed per-question validation; the plane only guards
+// the boundary (gate: malformed -> 400, never 500).
+func (p *Plane) systemOne(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "unreadable body")
+		return
+	}
+	var req systemOneRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "body is not valid JSON: "+err.Error())
+		return
+	}
+	if req.State == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "field 'state' is required")
+		return
+	}
+	if len(req.Questions) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "field 'questions' is required and non-empty")
+		return
+	}
+	resp, err := p.engine.send(http.MethodPost, "/v1/systemone", bytes.NewReader(body), "application/json")
+	if err != nil {
+		engineUnreachable(w, p.engine, err)
+		return
+	}
+	defer resp.Body.Close()
+	copyResponse(w, resp, false)
 }
 
 func main() {

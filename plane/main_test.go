@@ -133,6 +133,52 @@ func TestChatStreamFlushes(t *testing.T) {
 	}
 }
 
+func TestSystemOneValidationAndProxy(t *testing.T) {
+	// validation runs before any engine contact (dead port -> still 400)
+	p := testPlane(t, deadPortURL)
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"missing state", `{"questions":{"q":{"type":"noul"}}}`, http.StatusBadRequest},
+		{"empty questions", `{"state":"x","questions":{}}`, http.StatusBadRequest},
+		{"bad json", `{`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/systemone", strings.NewReader(tc.body))
+			p.routes().ServeHTTP(rr, req)
+			if rr.Code != tc.want {
+				t.Fatalf("code = %d, want %d (body %q)", rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+
+	// valid shape with a live STUB engine: proxied verbatim
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/systemone" {
+			t.Errorf("stub path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"sysone-1","results":{"q":{"type":"noul","probability":0.83}}}`))
+	}))
+	defer stub.Close()
+	pp := testPlane(t, stub.URL)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/systemone",
+		strings.NewReader(`{"state":"a state","questions":{"q":{"type":"noul"}}}`))
+	pp.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("systemone = %d (body %q)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"probability":0.83`) {
+		t.Fatalf("body = %q, want the engine's payload", rr.Body.String())
+	}
+}
+
 func TestLoadModelNameRequired(t *testing.T) {
 	p := testPlane(t, deadPortURL)
 	// The route pattern requires a name; an empty path can't match it, so

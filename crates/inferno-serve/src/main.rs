@@ -9,6 +9,7 @@
 //! POST /v1/chat/completions (OpenAI-shaped; non-streaming in this slice —
 //! SSE is the next pre-registered step).
 
+mod decision;
 mod http;
 mod server;
 
