@@ -132,6 +132,229 @@ impl ServeState {
         }
     }
 
+    /// Is this a streaming chat request? (`stream: true` in the body.)
+    /// The connection layer routes on this (docs/ENGINE-API.md SSE slice).
+    pub fn wants_stream(req: &Request) -> bool {
+        req.method == "POST"
+            && req.path == "/v1/chat/completions"
+            && serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+                .unwrap_or(false)
+    }
+
+    /// Streaming chat: SSE frames per token as the batcher produces them,
+    /// `data: [DONE]` at the end (docs/ENGINE-API.md SSE slice). Validation
+    /// failures still write a complete JSON error response first.
+    pub fn handle_streaming(
+        &mut self,
+        req: &Request,
+        out: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        use crate::http::{sse_data, stream_head, SSE_DONE};
+        let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => {
+                return write_all_response(out, &bad_request(&format!("body is not valid JSON: {e}")));
+            }
+        };
+        let Some(model) = body.get("model").and_then(|v| v.as_str()) else {
+            return write_all_response(out, &bad_request("field 'model' is required"));
+        };
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+        let prompt_ids: Option<Vec<u32>> = body
+            .get("prompt_ids")
+            .and_then(|v| v.as_array())
+            .map(|ids| ids.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect());
+        let prompt_text = if prompt_ids.is_some() {
+            String::new()
+        } else {
+            match extract_prompt(&body) {
+                Ok(p) => p,
+                Err(msg) => return write_all_response(out, &bad_request(&msg)),
+            }
+        };
+
+        if let Err(e) = self.reg.begin_request(model) {
+            let resp = match e {
+                inferno_model::registry::RegistryError::UnknownModel(_) => Response::json(
+                    404,
+                    &serde_json::json!({"error": {"type": "model_not_found",
+                        "message": format!("unknown model {model:?}")}}),
+                ),
+                other => Response::json(
+                    503,
+                    &serde_json::json!({"error": {"type": "model_unavailable",
+                        "message": other.to_string()}}),
+                ),
+            };
+            return write_all_response(out, &resp);
+        }
+        let tokens = match prompt_ids {
+            Some(ids) => Ok(ids),
+            None => match self.reg.get_mut(model) {
+                Ok(engine) if engine.has_tokenizer() => Ok(engine.encode_text(&prompt_text)),
+                Ok(_) => Err(format!(
+                    "model {model:?} has no tokenizer; send 'prompt_ids' instead"
+                )),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        let tokens = match tokens {
+            Ok(t) => t,
+            Err(msg) => {
+                let r = bad_request(&msg);
+                self.reg.end_request(model);
+                return write_all_response(out, &r);
+            }
+        };
+        if let Err(e) = self.ensure_batcher(model) {
+            let r = Response::json(
+                503,
+                &serde_json::json!({"error": {"type": "model_unavailable", "message": e}}),
+            );
+            self.reg.end_request(model);
+            return write_all_response(out, &r);
+        }
+
+        // ---- stream ----
+        out.write_all(&stream_head("text/event-stream"))?;
+        out.flush()?;
+        let id = {
+            let batcher = self.batchers.get_mut(model).expect("ensured above");
+            batcher.submit(Submit {
+                prompt: tokens.clone(),
+                max_gen: max_tokens,
+                priority: Priority::Normal,
+                ttft_slo_ms: 60_000.0,
+            })
+        };
+        let cmpl_id = {
+            let n = self.next_id;
+            self.next_id += 1;
+            format!("cmpl-{n}")
+        };
+        let mut written = 0usize;
+        let result = (|| -> std::io::Result<usize> {
+            loop {
+                {
+                    let engine = self.reg.get_mut(model).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
+                    let batcher = self.batchers.get_mut(model).expect("ensured above");
+                    batcher.step(engine, &NullAdmission);
+                }
+                // new tokens since the last flush
+                let new_texts: Vec<String> = {
+                    let engine = self.reg.get_mut(model).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
+                    let batcher = self.batchers.get(model).expect("ensured above");
+                    let toks: &[u32] = batcher.progress(id).unwrap_or(&[]);
+                    toks[written.min(toks.len())..]
+                        .iter()
+                        .map(|&t| {
+                            if engine.has_tokenizer() {
+                                engine.decode_text(&[t])
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .collect()
+                };
+                for text in new_texts {
+                    written += 1;
+                    let frame = serde_json::json!({
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": text},
+                            "finish_reason": serde_json::Value::Null,
+                        }],
+                    });
+                    out.write_all(&sse_data(&frame.to_string()))?;
+                    out.flush()?;
+                }
+                let done = self
+                    .batchers
+                    .get(model)
+                    .map(|b| b.finished_tokens.iter().any(|(i, _)| *i == id))
+                    .unwrap_or(false);
+                if done {
+                    // The final token(s) retire with the sequence — progress()
+                    // no longer sees them, so drain the finished list for any
+                    // deltas not yet written (otherwise the stream is one
+                    // token short and finish_reason is miscomputed).
+                    let rest: Vec<u32> = self
+                        .batchers
+                        .get(model)
+                        .and_then(|b| {
+                            b.finished_tokens
+                                .iter()
+                                .find(|(i, _)| *i == id)
+                                .map(|(_, t)| t.clone())
+                        })
+                        .unwrap_or_default();
+                    let engine = self.reg.get_mut(model).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
+                    for &t in rest.iter().skip(written) {
+                        let text = if engine.has_tokenizer() {
+                            engine.decode_text(&[t])
+                        } else {
+                            String::new()
+                        };
+                        written += 1;
+                        let frame = serde_json::json!({
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": text},
+                                "finish_reason": serde_json::Value::Null,
+                            }],
+                        });
+                        out.write_all(&sse_data(&frame.to_string()))?;
+                    }
+                    out.flush()?;
+                    break;
+                }
+            }
+            Ok(written)
+        })();
+        // final frame: finish_reason (+ [DONE])
+        let (reason, count) = match result {
+            Ok(n) => (
+                if n >= max_tokens { "length" } else { "stop" },
+                n,
+            ),
+            Err(_) => ("stop", written),
+        };
+        let final_frame = serde_json::json!({
+            "id": cmpl_id,
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": reason,
+            }],
+        });
+        let _ = out.write_all(&sse_data(&final_frame.to_string()));
+        let _ = out.write_all(SSE_DONE.as_bytes());
+        let _ = out.flush();
+        self.reg.end_request(model);
+        let _ = count;
+        Ok(())
+    }
+
     fn chat_completions(&mut self, req: &Request) -> Response {
         let body: serde_json::Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
@@ -331,6 +554,15 @@ fn bad_request(msg: &str) -> Response {
         400,
         &serde_json::json!({"error": {"type": "invalid_request", "message": msg}}),
     )
+}
+
+/// Write a complete (non-streaming) response to a stream.
+fn write_all_response(
+    out: &mut dyn std::io::Write,
+    resp: &Response,
+) -> std::io::Result<()> {
+    out.write_all(&resp.to_bytes())?;
+    out.flush()
 }
 
 #[cfg(test)]

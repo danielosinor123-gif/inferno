@@ -180,6 +180,23 @@ impl Response {
     }
 }
 
+/// Head bytes for a streamed response (no Content-Length — the body runs
+/// until the connection closes, which IS the framing signal).
+pub fn stream_head(content_type: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// One SSE `data:` frame.
+pub fn sse_data(json: &str) -> Vec<u8> {
+    format!("data: {json}\n\n").into_bytes()
+}
+
+/// The SSE terminator every client expects.
+pub const SSE_DONE: &str = "data: [DONE]\n\n";
+
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -246,5 +263,18 @@ mod tests {
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Type: application/json\r\n"));
         assert!(s.ends_with(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn stream_head_and_sse_frames() {
+        let head = String::from_utf8(stream_head("text/event-stream")).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.contains("Content-Type: text/event-stream\r\n"));
+        assert!(head.contains("Connection: close\r\n"));
+        assert!(head.ends_with("\r\n\r\n"));
+        assert!(!head.contains("Content-Length"), "streaming bodies have no Content-Length");
+        let frame = String::from_utf8(sse_data(r#"{"delta":{"content":" hi"}}"#)).unwrap();
+        assert_eq!(frame, "data: {\"delta\":{\"content\":\" hi\"}}\n\n");
+        assert!(SSE_DONE == "data: [DONE]\n\n");
     }
 }

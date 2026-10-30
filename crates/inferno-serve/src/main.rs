@@ -128,6 +128,15 @@ fn serve_connection(stream: TcpStream, state: &Mutex<ServeState>) -> std::io::Re
             .header("connection")
             .map(|v| v.eq_ignore_ascii_case("close"))
             .unwrap_or(false);
+        // Streaming chat runs its own protocol (SSE, connection-close
+        // framing) — the state lock is held for the generation.
+        if ServeState::wants_stream(&req) {
+            let mut s = state.lock().unwrap();
+            if let Err(e) = s.handle_streaming(&req, &mut out) {
+                eprintln!("stream error: {e}");
+            }
+            return Ok(());
+        }
         let resp = {
             let mut s = state.lock().unwrap();
             s.handle(&req)

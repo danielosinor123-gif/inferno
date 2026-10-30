@@ -195,8 +195,16 @@ impl Batcher {
         id
     }
 
-    pub fn queue_depth(&self) -> usize {
-        self.waiting.len() + self.running.len()
+    /// Tokens generated so far for a RUNNING sequence (mid-flight progress
+    /// for SSE streaming — docs/ENGINE-API.md). None once retired.
+    pub fn progress(&self, id: u64) -> Option<&[u32]> {
+        self.running
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.generated.as_slice())
+    }
+
+    pub fn queue_depth(&self) -> usize {        self.waiting.len() + self.running.len()
     }
 
     pub fn running_ids(&self) -> Vec<u64> {

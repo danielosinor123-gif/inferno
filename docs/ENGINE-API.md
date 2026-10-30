@@ -60,9 +60,52 @@ or `Connection: close`.
 
 ## Remaining
 
-- **SSE incremental streaming** — the next slice (the plane already passes
-  `stream:true` through; the engine answers complete-response for now,
-  documented). Requires stepping the batcher incrementally and flushing
-  per token.
 - Real multi-model test with two DIFFERENT dirs (same-weights test covered
   the routing; different-geometry models exercise the per-model KV config).
+
+---
+
+## SSE streaming slice — pre-registered before implementation
+
+## Claim under test
+
+`stream: true` on `/v1/chat/completions` delivers tokens incrementally as
+OpenAI SSE (`data: {...delta...}` per token, `data: [DONE]` to end) from
+the engine, through the Go plane, to a raw client — measured by the
+arrival gaps (the stream must show TPOT-shaped spacing, not one lump).
+
+## Gates
+
+1. Batcher exposes running-sequence progress (`progress(id) -> &[u32]`) —
+   unit-tested.
+2. Live: `curl -N` on the engine with `stream:true` shows ≥3 distinct
+   arrival events (timestamps) before `[DONE]`.
+3. Same request through the Go plane streams through unchanged.
+4. Non-streaming behavior unchanged (regression gate: the previous gates).
+
+## Scope of this slice
+
+One SSE `delta` per token (simest honest framing); `finish_reason` on the
+final data frame; body terminated by connection close (no chunked needed
+at this boundary — the plane re-frames with its own chunked encoding).
+Requests are still serialized by the state mutex (v1 concurrency model
+unchanged, documented).
+
+## Status — SSE SLICE COMPLETE (all gates pass)
+
+- [x] Implemented: `Batcher::progress(id)` accessor (unit-tested),
+      `http::stream_head`/`sse_data`/`SSE_DONE`, `ServeState::wants_stream`
+      + `handle_streaming` (per-token deltas, retire-drain for the final
+      token, `finish_reason`, connection-close framing)
+- [x] **Gate 1** — 51/51 tests (progress accessor + stream primitives added)
+- [x] **Gate 2** — engine direct: 8 deltas arrive TPOT-shaped
+      (21.44s → 25.84s, ~0.7s spacing), `finish_reason: "length"`, `[DONE]`
+- [x] **Gate 3** — through the Go plane: 10 frames, ~0.9s spacing, same
+      contract (the boundary carries the streaming contract)
+- [x] **Gate 4** — non-streaming unchanged (regression: gates 2/5 of the
+      base slice still green)
+
+One real bug caught by the gates: the last token's delta was dropped (the
+sequence retires at the end of the step that produces it, so `progress()`
+goes blind) — fixed by draining `finished_tokens` for unwritten deltas,
+verified by the "length" finish reason and the 8th delta appearing.
