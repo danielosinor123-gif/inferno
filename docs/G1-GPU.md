@@ -71,8 +71,15 @@ ADR-001: the moat lives in the layer we own.
       SCHED_BATCH needing _GNU_SOURCE, the unconditional tiled-matmul
       dependency (ggml-cpu/tiled/), and C++ symbols needing the C++ runtime
       at link time.
-- [x] **Bridge gate 0 (op-level) PASSES**: ggml mul_mat matches the scalar
-      gemv within the reference tolerance (crates/inferno-gpu/src/lib.rs test).
+- [x] **Bridge gates: FOUR ops match the scalar kernels** (rms_norm, rope
+      NEOX vs `kernels::rope`, swiglu/silu-mul, mul_mat) — all within the
+      reference tolerance, tests in crates/inferno-gpu/src/lib.rs.
+- **SIGSEGV caught by the gates, worth the record**: my first ggml_rope_ext
+  call used an 11-arg ABI (scalar position) — the pinned header takes 13
+  args with b = an i32 positions TENSOR. Lesson: FFI signatures get verified
+  against the pinned header, not against memory of the API. The classic
+  ggml_rope would have been wrong anyway: it hardcodes freq_base=10000
+  (Qwen2.5 needs theta=1e6), so the ext form with our theta is correct.
 - [ ] Engine-level hermetic conformance (full forward through ggml ops vs
       the scalar reference - the next step)
 - [ ] Real-model conformance (gate 1)

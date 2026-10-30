@@ -7,6 +7,9 @@ description = "ggml compute bridge for inferno (G1 — borrowed kernels, our arc
 
 [dependencies]
 
+[dev-dependencies]
+inferno-core = { path = "../inferno-core" }
+
 [build-dependencies]
 cc = "1"
 
